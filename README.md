@@ -7,9 +7,14 @@ derived from **Pedal Gain** with ReBuzz Multi-In support.
 
 - **6 stereo inputs → 1 stereo output** — connect up to six signals; they're summed at unity before the gain stage.
 - **Single Gain control** — 0 … 200 % (100 = unity / 0 dB, 200 = +6 dB).
-- **Stereo VU meter at the top of the parameters window** — instant-attack /
-  exponential-release ballistics on the audio thread, lightweight 33 ms UI
-  redraw, per-channel peak-hold indicator.
+- **Per-input solo** — one-click "S" button beside each input meter. If any
+  input is soloed, only soloed inputs reach the mix; if none are, everything
+  routes normally. Solo state is a real parameter — saved with the song,
+  automatable from the pattern editor, and undoable.
+- **Metering at the top of the parameters window** — six pre-solo input
+  peak meters plus a stereo output meter. Instant-attack / exponential-release
+  ballistics on the audio thread, lightweight 33 ms UI redraw, held-peak line
+  with synchronized dB readout.
 
 ## Requirements
 

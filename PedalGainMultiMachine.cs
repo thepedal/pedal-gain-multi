@@ -53,6 +53,15 @@ namespace WDE.PedalGainMulti
         public volatile float MeterL;
         public volatile float MeterR;
 
+        // ── Solo state ───────────────────────────────────────────────────────
+        // Audio thread reads this array from Work(); UI thread reads it to
+        // drive the solo-button highlight. Writes come from ReBuzz's own
+        // parameter-setter path (on the audio thread) — triggered either by
+        // a GUI button click calling IParameter.SetValue, or by the pattern
+        // editor, or by loading a song. A single bool is byte-atomic so no
+        // synchronization is needed for a 6-element flag array.
+        public readonly bool[] Solo = new bool[NumInputs];
+
         int cachedSr;
 
         // ── Gain parameter ───────────────────────────────────────────────────
@@ -66,6 +75,28 @@ namespace WDE.PedalGainMulti
             MaxValue    = 200,
             DefValue    = 100)]
         public int Gain { get; set; } = 100;
+
+        // ── Solo switches (one per input) ────────────────────────────────────
+        // bool → ParameterType.Switch. When ANY input is soloed, only soloed
+        // inputs route to the output. Each property just mirrors one slot of
+        // the Solo[] array so Work() only has to touch one cache line.
+        [ParameterDecl(Name = "Solo 1", Description = "Solo input 1", DefValue = 0)]
+        public bool Solo1 { get => Solo[0]; set => Solo[0] = value; }
+
+        [ParameterDecl(Name = "Solo 2", Description = "Solo input 2", DefValue = 0)]
+        public bool Solo2 { get => Solo[1]; set => Solo[1] = value; }
+
+        [ParameterDecl(Name = "Solo 3", Description = "Solo input 3", DefValue = 0)]
+        public bool Solo3 { get => Solo[2]; set => Solo[2] = value; }
+
+        [ParameterDecl(Name = "Solo 4", Description = "Solo input 4", DefValue = 0)]
+        public bool Solo4 { get => Solo[3]; set => Solo[3] = value; }
+
+        [ParameterDecl(Name = "Solo 5", Description = "Solo input 5", DefValue = 0)]
+        public bool Solo5 { get => Solo[4]; set => Solo[4] = value; }
+
+        [ParameterDecl(Name = "Solo 6", Description = "Solo input 6", DefValue = 0)]
+        public bool Solo6 { get => Solo[5]; set => Solo[5] = value; }
 
         // ── Construction ─────────────────────────────────────────────────────
         public PedalGainMultiMachine(IBuzzMachineHost host)
@@ -132,9 +163,16 @@ namespace WDE.PedalGainMulti
                 outBuf[s].R = 0f;
             }
 
-            // 2. Walk every input slot — sum connected ones into the output,
-            //    compute per-input peak, update each input meter. Disconnected
-            //    slots just let their meter fade to zero.
+            // Is any input soloed? If so, only soloed inputs route to output.
+            // If nothing is soloed, behaviour is unchanged from before.
+            bool anySolo = false;
+            for (int i = 0; i < NumInputs; i++)
+                if (Solo[i]) { anySolo = true; break; }
+
+            // 2. Walk every input slot — sum audible ones into the output,
+            //    compute per-input peak for the meter (always — solo doesn't
+            //    hide the input level, only its contribution to the mix),
+            //    and let disconnected slots fade their meter to zero.
             bool anyInput = false;
             int inCount = input?.Count ?? 0;
             for (int i = 0; i < NumInputs; i++)
@@ -148,14 +186,29 @@ namespace WDE.PedalGainMulti
                 anyInput = true;
 
                 float p = 0f;
-                for (int s = 0; s < n; s++)
+                bool muted = anySolo && !Solo[i];
+
+                if (muted)
                 {
-                    float l = inBuf[s].L;
-                    float r = inBuf[s].R;
-                    outBuf[s].L += l;
-                    outBuf[s].R += r;
-                    float a = MathF.Max(l < 0f ? -l : l, r < 0f ? -r : r);
-                    if (a > p) p = a;
+                    // Meter only — don't contribute to the mix.
+                    for (int s = 0; s < n; s++)
+                    {
+                        float l = inBuf[s].L, r = inBuf[s].R;
+                        float a = MathF.Max(l < 0f ? -l : l, r < 0f ? -r : r);
+                        if (a > p) p = a;
+                    }
+                }
+                else
+                {
+                    // Audible — sum into output AND feed the meter.
+                    for (int s = 0; s < n; s++)
+                    {
+                        float l = inBuf[s].L, r = inBuf[s].R;
+                        outBuf[s].L += l;
+                        outBuf[s].R += r;
+                        float a = MathF.Max(l < 0f ? -l : l, r < 0f ? -r : r);
+                        if (a > p) p = a;
+                    }
                 }
                 // Instant attack, exponential release — normalized to 0 dBFS = 1.
                 MeterIn[i] = MathF.Max(p / FULL_SCALE, MeterIn[i] * decay);
