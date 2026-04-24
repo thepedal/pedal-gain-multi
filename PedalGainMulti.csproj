@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>Pedal Gain Multi.NET</AssemblyName>
+    <RootNamespace>WDE.PedalGainMulti</RootNamespace>
+    <Nullable>disable</Nullable>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <Optimize>true</Optimize>
+
+    <!--
+      Output goes straight into the ReBuzz Effects gear folder.
+      Override on the command line if ReBuzz is installed elsewhere:
+        dotnet build PedalGainMulti.csproj -c Release /p:ReBuzzDir="D:\ReBuzz"
+    -->
+    <ReBuzzDir Condition="'$(ReBuzzDir)' == ''">C:\Program Files\ReBuzz</ReBuzzDir>
+    <OutputPath>$(ReBuzzDir)\Gear\Effects\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+
+    <AssemblyTitle>Pedal Gain Multi</AssemblyTitle>
+    <Company>WDE</Company>
+    <Product>Pedal Gain Multi</Product>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <!-- No XAML — GUI is built entirely in code to avoid BAML load issues. -->
+
+  <ItemGroup>
+    <!-- IBuzzMachine, MachineDecl, ParameterDecl, Sample, WorkModes -->
+    <Reference Include="ReBuzz">
+      <HintPath>$(ReBuzzDir)\ReBuzz.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- IMachineGUI, IMachineGUIFactory, IMachine, IBuzzMachineHost -->
+    <Reference Include="BuzzGUI.Interfaces">
+      <HintPath>$(ReBuzzDir)\BuzzGUI.Interfaces.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Global.Buzz.Song (needed for the MachineAdded hook that sets channel counts) -->
+    <Reference Include="BuzzGUI.Common">
+      <HintPath>$(ReBuzzDir)\BuzzGUI.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
