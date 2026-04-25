@@ -10,14 +10,16 @@
 //   [S] 5 ░░░░░░░░░░░░░░░░░░░░      -∞
 //   [S] 6 ░░░░░░░░░░░░░░░░░░░░      -∞
 //   ──────────────────────────────
-//   OUT
+//   [M] OUT
 //       L ██████████░░░░░░░░░░  -14.2 dB
 //       R ██████████░░░░░░░░░░  -14.5 dB
 //                  -48 -24 -12 -6 -3 0
 //
-// The [S] solo button for each input toggles the matching Solo{N} switch
-// parameter via IParameter.SetValue — same path the pattern editor uses —
-// so GUI, params window, and song state stay in sync.
+// [S] solo buttons toggle Solo{N} switch parameters (amber when on).
+// [M] mute button toggles the Mute switch parameter (red when on); the
+// machine ramps a per-sample mute-gain over ~25 ms to avoid clicks. All
+// parameter writes go through IParameter.SetValue so the GUI, params
+// window, pattern editor, undo and save/load stay in sync.
 //
 // Meter ballistics run on the audio thread (see PedalGainMultiMachine.Work);
 // this GUI just reads volatile values on a 33 ms timer.
@@ -75,6 +77,10 @@ namespace WDE.PedalGainMulti
         float holdDbL = DB_MIN, holdDbR = DB_MIN;
         int   holdFramesL,      holdFramesR;
 
+        // Mute widgets (single button gating the whole output)
+        Border    muteButton;
+        TextBlock muteLabel;
+
         // ── Layout constants ─────────────────────────────────────────────────
         const float SOLO_W    = 14f;
         const float LABEL_W   = 14f;
@@ -99,6 +105,11 @@ namespace WDE.PedalGainMulti
         static readonly Brush SoloOnBg    = Freeze(new SolidColorBrush(Color.FromRgb(235, 185,  40)));
         static readonly Brush SoloOnFg    = Freeze(new SolidColorBrush(Color.FromRgb(20,  20,  25)));
         static readonly Brush SoloBorder  = Freeze(new SolidColorBrush(Color.FromRgb(70,  70,  80)));
+
+        // Mute uses the same "off" recessed look but red when active —
+        // standard DAW colour convention (solo = yellow, mute = red).
+        static readonly Brush MuteOnBg    = Freeze(new SolidColorBrush(Color.FromRgb(215,  55,  45)));
+        static readonly Brush MuteOnFg    = Freeze(new SolidColorBrush(Color.FromRgb(245, 245, 245)));
 
         static readonly FontFamily Mono = new FontFamily("Consolas");
 
@@ -163,7 +174,12 @@ namespace WDE.PedalGainMulti
                 grid.Margin = new Thickness(0, 1, 0, 1);
 
                 // Col 0 — solo button.
-                var (btn, btnLbl) = MakeSoloButton(i);
+                var (btn, btnLbl) = MakeToggleButton(
+                    letter:    "S",
+                    tooltip:   $"Solo input {i + 1}",
+                    paramName: $"Solo {i + 1}",
+                    onBg:      SoloOnBg,
+                    onFg:      SoloOnFg);
                 Grid.SetColumn(btn, 0);
                 grid.Children.Add(btn);
                 soloButtons[i] = btn;
@@ -200,7 +216,10 @@ namespace WDE.PedalGainMulti
                 HorizontalAlignment = HorizontalAlignment.Stretch
             });
 
-            root.Children.Add(SectionHeader("OUT"));
+            // OUT header row: [M] mute button + "OUT" label, aligned to the
+            // same 4-column grid as the input rows so the mute button sits
+            // directly under the column of solo buttons above.
+            root.Children.Add(BuildOutHeaderRow());
 
             (barL, peakL, dbTextL) = AddOutputRow(root, "L", grad);
             (barR, peakR, dbTextR) = AddOutputRow(root, "R", grad);
@@ -221,6 +240,40 @@ namespace WDE.PedalGainMulti
                 Foreground = SectionColor,
                 Margin     = new Thickness(0, 1, 0, 1)
             };
+        }
+
+        // OUT section header row: mute button in col 0 + "OUT" label in col 1.
+        // Uses the same grid as the input rows so the [M] button aligns
+        // vertically with the column of [S] solo buttons above.
+        UIElement BuildOutHeaderRow()
+        {
+            var grid = MakeRowGrid();
+            grid.Margin = new Thickness(0, 1, 0, 1);
+
+            var (btn, btnLbl) = MakeToggleButton(
+                letter:    "M",
+                tooltip:   "Mute output (with ~25 ms fade)",
+                paramName: "Mute",
+                onBg:      MuteOnBg,
+                onFg:      MuteOnFg);
+            Grid.SetColumn(btn, 0);
+            grid.Children.Add(btn);
+            muteButton = btn;
+            muteLabel  = btnLbl;
+
+            // The "OUT" label lives in col 1, styled to match the IN header.
+            var hdr = new TextBlock
+            {
+                Text              = "OUT",
+                FontFamily        = Mono,
+                FontSize          = 8,
+                Foreground        = SectionColor,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Grid.SetColumn(hdr, 1);
+            grid.Children.Add(hdr);
+
+            return grid;
         }
 
         static TextBlock RowLabel(string text, int col)
@@ -332,13 +385,14 @@ namespace WDE.PedalGainMulti
             return grid;
         }
 
-        // ── Solo button ──────────────────────────────────────────────────────
+        // ── Toggle buttons (used by both solo and mute) ──────────────────────
 
-        (Border border, TextBlock label) MakeSoloButton(int inputIdx)
+        (Border border, TextBlock label)
+            MakeToggleButton(string letter, string tooltip, string paramName, Brush onBg, Brush onFg)
         {
             var text = new TextBlock
             {
-                Text                = "S",
+                Text                = letter,
                 FontFamily          = Mono,
                 FontSize            = 9,
                 FontWeight          = FontWeights.Bold,
@@ -357,35 +411,52 @@ namespace WDE.PedalGainMulti
                 CornerRadius        = new CornerRadius(2),
                 Child               = text,
                 Cursor              = Cursors.Hand,
-                ToolTip             = $"Solo input {inputIdx + 1}",
+                ToolTip             = tooltip,
                 VerticalAlignment   = VerticalAlignment.Center,
-                HorizontalAlignment = HorizontalAlignment.Left
+                HorizontalAlignment = HorizontalAlignment.Left,
+                // Stash the on-colours on the button itself so the tick can
+                // recolour without needing a parallel data structure.
+                Tag                 = new ToggleColors(onBg, onFg)
             };
 
             btn.MouseLeftButtonDown += (_, e) =>
             {
-                ToggleSolo(inputIdx);
+                ToggleParameter(paramName);
                 e.Handled = true;
             };
 
             return (btn, text);
         }
 
-        // Flip the matching Solo{N} parameter via the ReBuzz parameter API.
-        // Going through IParameter.SetValue (instead of writing the property
-        // directly) keeps pattern editor, params window, undo and save/load
-        // all consistent with the GUI.
-        void ToggleSolo(int i)
+        // Holds the per-button "on" colours so RefreshToggleVisual can recolour
+        // any button uniformly. Off colours are shared (SoloOffBg / SoloOffFg).
+        sealed class ToggleColors
+        {
+            public readonly Brush OnBg, OnFg;
+            public ToggleColors(Brush onBg, Brush onFg) { OnBg = onBg; OnFg = onFg; }
+        }
+
+        static void RefreshToggleVisual(Border btn, TextBlock label, bool on)
+        {
+            var c = (ToggleColors)btn.Tag;
+            btn.Background   = on ? c.OnBg : SoloOffBg;
+            label.Foreground = on ? c.OnFg : SoloOffFg;
+        }
+
+        // Flip a named bool parameter via the ReBuzz parameter API. Going
+        // through IParameter.SetValue (rather than writing the property
+        // directly) keeps the GUI, params window, pattern editor, undo and
+        // save/load all consistent.
+        void ToggleParameter(string name)
         {
             if (imachine?.ParameterGroups == null) return;
 
-            string target = $"Solo {i + 1}";
             foreach (var pg in imachine.ParameterGroups)
             {
                 if (pg?.Parameters == null) continue;
                 foreach (var p in pg.Parameters)
                 {
-                    if (p?.Name != target) continue;
+                    if (p?.Name != name) continue;
                     int cur = p.GetValue(0);
                     p.SetValue(0, cur == 0 ? 1 : 0);
                     return;
@@ -439,10 +510,11 @@ namespace WDE.PedalGainMulti
                 // Refresh solo button visual — machine.Solo[] is the source of
                 // truth, updated by ReBuzz when the parameter changes (either
                 // via our click handler, the pattern editor, or a song load).
-                bool on = machine.Solo[i];
-                soloButtons[i].Background = on ? SoloOnBg : SoloOffBg;
-                soloLabels[i].Foreground  = on ? SoloOnFg : SoloOffFg;
+                RefreshToggleVisual(soloButtons[i], soloLabels[i], machine.Solo[i]);
             }
+
+            // Mute button — same source-of-truth pattern.
+            RefreshToggleVisual(muteButton, muteLabel, machine.Mute);
 
             // Stereo output meter — hold-synchronized readout.
             float l = machine.MeterL;

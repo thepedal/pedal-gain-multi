@@ -62,6 +62,15 @@ namespace WDE.PedalGainMulti
         // synchronization is needed for a 6-element flag array.
         public readonly bool[] Solo = new bool[NumInputs];
 
+        // ── Mute state with inertia ──────────────────────────────────────────
+        // The Mute parameter just flips a target; currentMuteGain ramps toward
+        // it inside Work() to avoid clicks. Linear ~25 ms fade.
+        // muteInitialized snaps the ramp to its target on the first Work()
+        // after construction, so loading a song with Mute=true doesn't cause
+        // an audible fade-down at song start.
+        float currentMuteGain = 1f;
+        bool  muteInitialized;
+
         int cachedSr;
 
         // ── Gain parameter ───────────────────────────────────────────────────
@@ -97,6 +106,17 @@ namespace WDE.PedalGainMulti
 
         [ParameterDecl(Name = "Solo 6", Description = "Solo input 6", DefValue = 0)]
         public bool Solo6 { get => Solo[5]; set => Solo[5] = value; }
+
+        // ── Mute (with inertia) ──────────────────────────────────────────────
+        // IMPORTANT — declared LAST so parameter ordering for existing songs
+        // (Gain, Solo 1..6) is unchanged. Old songs that don't have a Mute
+        // value stored will fall back to DefValue=0 (= not muted), so the
+        // upgrade is fully backwards-compatible.
+        [ParameterDecl(
+            Name        = "Mute",
+            Description = "Mute the output (with ~25 ms fade in/out)",
+            DefValue    = 0)]
+        public bool Mute { get; set; }
 
         // ── Construction ─────────────────────────────────────────────────────
         public PedalGainMultiMachine(IBuzzMachineHost host)
@@ -214,12 +234,38 @@ namespace WDE.PedalGainMulti
                 MeterIn[i] = MathF.Max(p / FULL_SCALE, MeterIn[i] * decay);
             }
 
-            // 3. Apply gain and collect per-channel output peaks.
+            // 3. Apply gain × mute-ramp and collect per-channel output peaks.
+            //
+            //    The mute ramp lives here (rather than as a separate pass)
+            //    because it folds into the same per-sample multiply that the
+            //    gain stage already needs. On the first Work() call after
+            //    construction we snap to the target so song-loaded mutes
+            //    don't produce a fade-down on startup.
+            float targetMuteGain = Mute ? 0f : 1f;
+            if (!muteInitialized)
+            {
+                currentMuteGain  = targetMuteGain;
+                muteInitialized  = true;
+            }
+
+            // Per-sample step for a 25 ms linear fade. Falls back to a coarse
+            // value if we don't have a sample rate yet.
+            float muteStep = cachedSr > 0
+                ? 1f / (cachedSr * 0.025f)
+                : 0.04f;
+
             float peakL = 0f, peakR = 0f;
             for (int s = 0; s < n; s++)
             {
-                float l = outBuf[s].L * g;
-                float r = outBuf[s].R * g;
+                // Inertia ramp toward target.
+                if (currentMuteGain < targetMuteGain)
+                    currentMuteGain = MathF.Min(currentMuteGain + muteStep, targetMuteGain);
+                else if (currentMuteGain > targetMuteGain)
+                    currentMuteGain = MathF.Max(currentMuteGain - muteStep, targetMuteGain);
+
+                float effG = g * currentMuteGain;
+                float l = outBuf[s].L * effG;
+                float r = outBuf[s].R * effG;
                 outBuf[s].L = l;
                 outBuf[s].R = r;
 
