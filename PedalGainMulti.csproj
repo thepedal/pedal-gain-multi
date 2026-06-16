@@ -2,9 +2,6 @@
 
   <PropertyGroup>
     <TargetFramework>net10.0-windows</TargetFramework>
-    <DebugType>none</DebugType>
-    <DebugSymbols>false</DebugSymbols>
-    <GenerateDependencyFile>false</GenerateDependencyFile>
     <UseWPF>true</UseWPF>
     <AssemblyName>Pedal Gain Multi.NET</AssemblyName>
     <RootNamespace>WDE.PedalGainMulti</RootNamespace>
@@ -12,6 +9,25 @@
     <Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
     <Optimize>true</Optimize>
+
+    <!--
+      Deployment hygiene (mandatory for every ReBuzz managed machine):
+      ReBuzz only loads the .dll at runtime, so .pdb / .deps.json would
+      just clutter C:\Program Files\ReBuzz\Gear\Effects.
+    -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+
+    <!--
+      MSB3277 fires because ReBuzz.dll transitively references
+      Jacobi.Vst.Host.Interop.dll, which was built against newer
+      Microsoft.VisualBasic / System.Drawing assemblies than the .NET 10
+      SDK ships. We don't touch either assembly, and the transitive refs
+      are marked Private=false below so nothing ships in the output. The
+      warning is purely a build-time graph complaint — suppress it.
+    -->
+    <NoWarn>$(NoWarn);MSB3277</NoWarn>
 
     <!--
       Output goes straight into the ReBuzz Effects gear folder.

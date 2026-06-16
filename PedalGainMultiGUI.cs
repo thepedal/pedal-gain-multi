@@ -17,8 +17,9 @@
 //
 // [S] solo buttons toggle Solo{N} switch parameters (amber when on).
 // [M] mute button toggles the Mute switch parameter (red when on); the
-// machine ramps a per-sample mute-gain over ~25 ms to avoid clicks. All
-// parameter writes go through IParameter.SetValue so the GUI, params
+// machine ramps a per-sample mute-gain over `Inertia` ms (defaults to
+// 25 ms) to avoid clicks, configurable per-instance in the params window.
+// All parameter writes go through IParameter.SetValue so the GUI, params
 // window, pattern editor, undo and save/load stay in sync.
 //
 // Meter ballistics run on the audio thread (see PedalGainMultiMachine.Work);
@@ -252,7 +253,7 @@ namespace WDE.PedalGainMulti
 
             var (btn, btnLbl) = MakeToggleButton(
                 letter:    "M",
-                tooltip:   "Mute output (with ~25 ms fade)",
+                tooltip:   "Mute output (fade time = Inertia parameter)",
                 paramName: "Mute",
                 onBg:      MuteOnBg,
                 onFg:      MuteOnFg);

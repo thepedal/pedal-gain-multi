@@ -108,15 +108,29 @@ namespace WDE.PedalGainMulti
         public bool Solo6 { get => Solo[5]; set => Solo[5] = value; }
 
         // ── Mute (with inertia) ──────────────────────────────────────────────
-        // IMPORTANT — declared LAST so parameter ordering for existing songs
-        // (Gain, Solo 1..6) is unchanged. Old songs that don't have a Mute
-        // value stored will fall back to DefValue=0 (= not muted), so the
-        // upgrade is fully backwards-compatible.
+        // IMPORTANT — declared LAST in the original release so parameter
+        // ordering for existing songs (Gain, Solo 1..6) was unchanged. Old
+        // songs that don't have a Mute value stored fall back to DefValue=0
+        // (= not muted), so the upgrade was fully backwards-compatible.
         [ParameterDecl(
             Name        = "Mute",
-            Description = "Mute the output (with ~25 ms fade in/out)",
+            Description = "Mute the output (fade time set by Inertia)",
             DefValue    = 0)]
         public bool Mute { get; set; }
+
+        // ── Inertia ──────────────────────────────────────────────────────────
+        // Fade time (ms) used when Mute toggles. Declared AFTER Mute so older
+        // songs (which had Mute hard-coded to a 25 ms ramp) load with the
+        // default value of 25 and sound identical to before. Range 0..500 ms;
+        // 0 means an instant snap (no declick).
+        [ParameterDecl(
+            Name            = "Inertia",
+            Description     = "Mute fade time in milliseconds (0 = instant)",
+            MinValue        = 0,
+            MaxValue        = 500,
+            DefValue        = 25,
+            ValueDescriptor = Descriptors.Milliseconds)]
+        public int Inertia { get; set; } = 25;
 
         // ── Construction ─────────────────────────────────────────────────────
         public PedalGainMultiMachine(IBuzzMachineHost host)
@@ -248,11 +262,12 @@ namespace WDE.PedalGainMulti
                 muteInitialized  = true;
             }
 
-            // Per-sample step for a 25 ms linear fade. Falls back to a coarse
-            // value if we don't have a sample rate yet.
-            float muteStep = cachedSr > 0
-                ? 1f / (cachedSr * 0.025f)
-                : 0.04f;
+            // Per-sample step for a linear fade of length `Inertia` ms.
+            // Inertia=0 (or no sample rate yet) → snap to target in one sample.
+            float fadeSeconds = Inertia * 0.001f;
+            float muteStep = (fadeSeconds > 0f && cachedSr > 0)
+                ? 1f / (cachedSr * fadeSeconds)
+                : 1f;
 
             float peakL = 0f, peakR = 0f;
             for (int s = 0; s < n; s++)

@@ -11,10 +11,13 @@ derived from **Pedal Gain** with ReBuzz Multi-In support.
   input is soloed, only soloed inputs reach the mix; if none are, everything
   routes normally. Solo state is a real parameter — saved with the song,
   automatable from the pattern editor, and undoable.
-- **Output mute with inertia** — single "M" button at the top of the output
-  section. Applies a per-sample ~25 ms linear fade so toggling never clicks.
-  Saved as a parameter. Backwards compatible: songs saved before the Mute
-  parameter existed load with Mute = false (= unmuted), so behaviour is
+- **Output mute with adjustable inertia** — single "M" button at the top of
+  the output section. The fade time is set by the **Inertia** parameter
+  (0–500 ms, default 25 ms), so you can dial it from a tight 5 ms declick all
+  the way out to a half-second fade. `Inertia = 0` snaps instantly. Both
+  Mute and Inertia are real parameters — saved with the song, automatable,
+  undoable. Backwards compatible: songs saved before either parameter
+  existed load with Mute = false and Inertia = 25, so behaviour is
   identical to previous versions.
 - **Metering at the top of the parameters window** — six pre-solo input
   peak meters plus a stereo output meter. Instant-attack / exponential-release
