@@ -7,10 +7,12 @@ derived from **Pedal Gain** with ReBuzz Multi-In support.
 
 - **6 stereo inputs → 1 stereo output** — connect up to six signals; they're summed at unity before the gain stage.
 - **Single Gain control** — 0 … 200 % (100 = unity / 0 dB, 200 = +6 dB).
-- **Per-input solo** — one-click "S" button beside each input meter. If any
-  input is soloed, only soloed inputs reach the mix; if none are, everything
-  routes normally. Solo state is a real parameter — saved with the song,
-  automatable from the pattern editor, and undoable.
+- **Per-input mute and solo** — each input has an "M" and "S" button.
+  Per-input mute fades using the global Inertia setting (same ramp as the
+  output mute). Solo follows the standard "if any soloed, only soloed
+  inputs route" rule; mute beats solo (a muted input stays silent even
+  when soloed). All states are real parameters — saved with the song,
+  automatable from the pattern editor, undoable.
 - **Output mute with adjustable inertia** — single "M" button at the top of
   the output section. The fade time is set by the **Inertia** parameter
   (0–500 ms, default 25 ms), so you can dial it from a tight 5 ms declick all

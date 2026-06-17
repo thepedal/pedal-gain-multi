@@ -3,22 +3,25 @@
 // Renders a compact meter stack at the top of the parameters window:
 //
 //   IN
-//   [S] 1 ████████████░░░░░░░░  -12.3 dB
-//   [S] 2 ██████░░░░░░░░░░░░░░  -18.1 dB
-//   [S] 3 ░░░░░░░░░░░░░░░░░░░░      -∞
-//   [S] 4 ░░░░░░░░░░░░░░░░░░░░      -∞
-//   [S] 5 ░░░░░░░░░░░░░░░░░░░░      -∞
-//   [S] 6 ░░░░░░░░░░░░░░░░░░░░      -∞
+//   [M][S] 1 ████████████░░░░░░░░  -12.3 dB
+//   [M][S] 2 ██████░░░░░░░░░░░░░░  -18.1 dB
+//   [M][S] 3 ░░░░░░░░░░░░░░░░░░░░      -∞
+//   [M][S] 4 ░░░░░░░░░░░░░░░░░░░░      -∞
+//   [M][S] 5 ░░░░░░░░░░░░░░░░░░░░      -∞
+//   [M][S] 6 ░░░░░░░░░░░░░░░░░░░░      -∞
 //   ──────────────────────────────
-//   [M] OUT
-//       L ██████████░░░░░░░░░░  -14.2 dB
-//       R ██████████░░░░░░░░░░  -14.5 dB
-//                  -48 -24 -12 -6 -3 0
+//   [M]    OUT
+//          L ██████████░░░░░░░░░░  -14.2 dB
+//          R ██████████░░░░░░░░░░  -14.5 dB
+//                     -48 -24 -12 -6 -3 0
 //
-// [S] solo buttons toggle Solo{N} switch parameters (amber when on).
-// [M] mute button toggles the Mute switch parameter (red when on); the
-// machine ramps a per-sample mute-gain over `Inertia` ms (defaults to
-// 25 ms) to avoid clicks, configurable per-instance in the params window.
+// [M] mute buttons (red when on) toggle the Mute / Mute{N} switch
+// parameters; [S] solo buttons (amber when on) toggle Solo{N} switch
+// parameters. The per-input [M]s align vertically with the output [M]
+// — all mutes stack in column 0. Per-input mutes ramp at the same rate
+// as the output mute (set by the global Inertia parameter, 0–500 ms,
+// default 25) and follow the DAW convention of mute beating solo.
+//
 // All parameter writes go through IParameter.SetValue so the GUI, params
 // window, pattern editor, undo and save/load stay in sync.
 //
@@ -63,13 +66,15 @@ namespace WDE.PedalGainMulti
         readonly DispatcherTimer timer;
 
         // Per-input widgets
-        readonly Border[]    soloButtons  = new Border[NumInputs];
-        readonly TextBlock[] soloLabels   = new TextBlock[NumInputs];
-        readonly Rectangle[] inBars       = new Rectangle[NumInputs];
-        readonly Rectangle[] inPeakLines  = new Rectangle[NumInputs];
-        readonly TextBlock[] inDbTexts    = new TextBlock[NumInputs];
-        readonly float[]     inHoldDb     = new float[NumInputs];
-        readonly int[]       inHoldFrames = new int[NumInputs];
+        readonly Border[]    inMuteButtons = new Border[NumInputs];
+        readonly TextBlock[] inMuteLabels  = new TextBlock[NumInputs];
+        readonly Border[]    soloButtons   = new Border[NumInputs];
+        readonly TextBlock[] soloLabels    = new TextBlock[NumInputs];
+        readonly Rectangle[] inBars        = new Rectangle[NumInputs];
+        readonly Rectangle[] inPeakLines   = new Rectangle[NumInputs];
+        readonly TextBlock[] inDbTexts     = new TextBlock[NumInputs];
+        readonly float[]     inHoldDb      = new float[NumInputs];
+        readonly int[]       inHoldFrames  = new int[NumInputs];
 
         // Output widgets
         Rectangle barL,  barR;
@@ -83,7 +88,8 @@ namespace WDE.PedalGainMulti
         TextBlock muteLabel;
 
         // ── Layout constants ─────────────────────────────────────────────────
-        const float SOLO_W    = 14f;
+        const float MUTE_W    = 14f;   // per-input M button column
+        const float SOLO_W    = 14f;   // per-input S button column
         const float LABEL_W   = 14f;
         const float W         = 200f;
         const float READOUT_W = 46f;
@@ -147,14 +153,17 @@ namespace WDE.PedalGainMulti
 
         // ── Layout helpers ───────────────────────────────────────────────────
 
-        // Every row shares this 4-column grid:
-        //   col 0 — solo button (empty on output / scale rows)
-        //   col 1 — label
-        //   col 2 — bar area (W px, the pixel-aligned meter column)
-        //   col 3 — dB readout
+        // Every row shares this 5-column grid:
+        //   col 0 — per-input mute button [M] (empty on output L/R and scale rows;
+        //           the output mute button also lives here on its own header row)
+        //   col 1 — per-input solo button [S] (empty everywhere except input rows)
+        //   col 2 — label
+        //   col 3 — bar area (W px, the pixel-aligned meter column)
+        //   col 4 — dB readout
         static Grid MakeRowGrid()
         {
             var g = new Grid();
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(MUTE_W)    });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(SOLO_W)    });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(LABEL_W)   });
             g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(W)         });
@@ -174,31 +183,43 @@ namespace WDE.PedalGainMulti
                 var grid = MakeRowGrid();
                 grid.Margin = new Thickness(0, 1, 0, 1);
 
-                // Col 0 — solo button.
-                var (btn, btnLbl) = MakeToggleButton(
+                // Col 0 — per-input mute button.
+                var (mbtn, mlbl) = MakeToggleButton(
+                    letter:    "M",
+                    tooltip:   $"Mute input {i + 1} (fade time = Inertia)",
+                    paramName: $"Mute {i + 1}",
+                    onBg:      MuteOnBg,
+                    onFg:      MuteOnFg);
+                Grid.SetColumn(mbtn, 0);
+                grid.Children.Add(mbtn);
+                inMuteButtons[i] = mbtn;
+                inMuteLabels[i]  = mlbl;
+
+                // Col 1 — solo button.
+                var (sbtn, slbl) = MakeToggleButton(
                     letter:    "S",
                     tooltip:   $"Solo input {i + 1}",
                     paramName: $"Solo {i + 1}",
                     onBg:      SoloOnBg,
                     onFg:      SoloOnFg);
-                Grid.SetColumn(btn, 0);
-                grid.Children.Add(btn);
-                soloButtons[i] = btn;
-                soloLabels[i]  = btnLbl;
+                Grid.SetColumn(sbtn, 1);
+                grid.Children.Add(sbtn);
+                soloButtons[i] = sbtn;
+                soloLabels[i]  = slbl;
 
-                // Col 1 — input number label.
-                grid.Children.Add(RowLabel((i + 1).ToString(), col: 1));
+                // Col 2 — input number label.
+                grid.Children.Add(RowLabel((i + 1).ToString(), col: 2));
 
-                // Col 2 — bar canvas + peak-hold line.
+                // Col 3 — bar canvas + peak-hold line.
                 var (canvas, bar, peak) = BuildBarCanvas(grad);
-                Grid.SetColumn(canvas, 2);
+                Grid.SetColumn(canvas, 3);
                 grid.Children.Add(canvas);
                 inBars[i]      = bar;
                 inPeakLines[i] = peak;
 
-                // Col 3 — dB readout.
+                // Col 4 — dB readout.
                 var db = RowReadout();
-                Grid.SetColumn(db, 3);
+                Grid.SetColumn(db, 4);
                 grid.Children.Add(db);
                 inDbTexts[i] = db;
 
@@ -213,7 +234,7 @@ namespace WDE.PedalGainMulti
             {
                 Height              = 1,
                 Fill                = SeparatorBrush,
-                Margin              = new Thickness(SOLO_W + LABEL_W, 5, READOUT_W, 3),
+                Margin              = new Thickness(MUTE_W + SOLO_W + LABEL_W, 5, READOUT_W, 3),
                 HorizontalAlignment = HorizontalAlignment.Stretch
             });
 
@@ -228,7 +249,7 @@ namespace WDE.PedalGainMulti
             root.Children.Add(MakeScaleRow());
 
             Content  = root;
-            MinWidth = SOLO_W + LABEL_W + W + READOUT_W + 12;
+            MinWidth = MUTE_W + SOLO_W + LABEL_W + W + READOUT_W + 12;
         }
 
         static UIElement SectionHeader(string text)
@@ -243,9 +264,10 @@ namespace WDE.PedalGainMulti
             };
         }
 
-        // OUT section header row: mute button in col 0 + "OUT" label in col 1.
-        // Uses the same grid as the input rows so the [M] button aligns
-        // vertically with the column of [S] solo buttons above.
+        // OUT section header row: mute button in col 0 + "OUT" label in col 2.
+        // The mute button stays in col 0 so it aligns vertically with the
+        // column of per-input [M] buttons above — visually all the mutes
+        // stack in the same column.
         UIElement BuildOutHeaderRow()
         {
             var grid = MakeRowGrid();
@@ -262,7 +284,7 @@ namespace WDE.PedalGainMulti
             muteButton = btn;
             muteLabel  = btnLbl;
 
-            // The "OUT" label lives in col 1, styled to match the IN header.
+            // The "OUT" label lives in col 2, styled to match the IN header.
             var hdr = new TextBlock
             {
                 Text              = "OUT",
@@ -271,7 +293,7 @@ namespace WDE.PedalGainMulti
                 Foreground        = SectionColor,
                 VerticalAlignment = VerticalAlignment.Center
             };
-            Grid.SetColumn(hdr, 1);
+            Grid.SetColumn(hdr, 2);
             grid.Children.Add(hdr);
 
             return grid;
@@ -333,37 +355,38 @@ namespace WDE.PedalGainMulti
             return (canvas, bar, peak);
         }
 
-        // Helper used for the output L / R rows — no solo column, same grid
-        // so the bar column still aligns pixel-for-pixel with the input rows.
+        // Helper used for the output L / R rows — no toggle buttons, same
+        // grid so the bar column still aligns pixel-for-pixel with the
+        // input rows.
         (Rectangle bar, Rectangle peak, TextBlock db)
             AddOutputRow(Panel parent, string label, Brush fill)
         {
             var grid = MakeRowGrid();
             grid.Margin = new Thickness(0, 1, 0, 1);
 
-            grid.Children.Add(RowLabel(label, col: 1));
+            grid.Children.Add(RowLabel(label, col: 2));
 
             var (canvas, bar, peak) = BuildBarCanvas(fill);
-            Grid.SetColumn(canvas, 2);
+            Grid.SetColumn(canvas, 3);
             grid.Children.Add(canvas);
 
             var db = RowReadout();
-            Grid.SetColumn(db, 3);
+            Grid.SetColumn(db, 4);
             grid.Children.Add(db);
 
             parent.Children.Add(grid);
             return (bar, peak, db);
         }
 
-        // Scale row re-uses MakeRowGrid so column 2 matches the bar widths
-        // pixel-for-pixel. Cols 0 / 1 / 3 stay empty.
+        // Scale row re-uses MakeRowGrid so column 3 matches the bar widths
+        // pixel-for-pixel. Cols 0 / 1 / 2 / 4 stay empty.
         UIElement MakeScaleRow()
         {
             var grid = MakeRowGrid();
             grid.Margin = new Thickness(0, 2, 0, 0);
 
             var canvas = new Canvas { Width = W, Height = 11 };
-            Grid.SetColumn(canvas, 2);
+            Grid.SetColumn(canvas, 3);
 
             int[] marks = { -48, -36, -24, -12, -6, -3, 0 };
             foreach (int db in marks)
@@ -404,6 +427,9 @@ namespace WDE.PedalGainMulti
 
             var btn = new Border
             {
+                // MUTE_W == SOLO_W, so the same button width works in both
+                // columns. Two-pixel padding keeps the buttons visually
+                // separated when they sit side-by-side in an input row.
                 Width               = SOLO_W - 2,
                 Height              = H,
                 Background          = SoloOffBg,
@@ -500,7 +526,7 @@ namespace WDE.PedalGainMulti
         {
             if (machine == null) return;
 
-            // Per-input meters + solo button state.
+            // Per-input meters + solo / mute button state.
             for (int i = 0; i < NumInputs; i++)
             {
                 float v = machine.MeterIn[i];
@@ -508,10 +534,12 @@ namespace WDE.PedalGainMulti
                 UpdateHold(ref inHoldDb[i], ref inHoldFrames[i], LinToDb(v), inPeakLines[i]);
                 inDbTexts[i].Text = FormatDb(inHoldDb[i]);
 
-                // Refresh solo button visual — machine.Solo[] is the source of
-                // truth, updated by ReBuzz when the parameter changes (either
-                // via our click handler, the pattern editor, or a song load).
-                RefreshToggleVisual(soloButtons[i], soloLabels[i], machine.Solo[i]);
+                // Refresh toggle buttons — machine.Solo[] and machine.InMute[]
+                // are the source of truth, updated by ReBuzz when the matching
+                // parameter changes (via our click handler, the pattern editor,
+                // or a song load).
+                RefreshToggleVisual(inMuteButtons[i], inMuteLabels[i], machine.InMute[i]);
+                RefreshToggleVisual(soloButtons[i],   soloLabels[i],   machine.Solo[i]);
             }
 
             // Mute button — same source-of-truth pattern.

@@ -62,6 +62,14 @@ namespace WDE.PedalGainMulti
         // synchronization is needed for a 6-element flag array.
         public readonly bool[] Solo = new bool[NumInputs];
 
+        // ── Per-input mute state ─────────────────────────────────────────────
+        // Mirrors the InMute{N} parameters in the same way Solo[] mirrors the
+        // Solo{N} parameters. Each input has its own ramped gain; all share
+        // the global Inertia setting via the same muteStep computation in Work.
+        public readonly bool[]  InMute            = new bool[NumInputs];
+        readonly        float[] currentInMuteGain = new float[NumInputs];
+        bool                    inMuteInitialized;
+
         // ── Mute state with inertia ──────────────────────────────────────────
         // The Mute parameter just flips a target; currentMuteGain ramps toward
         // it inside Work() to avoid clicks. Linear ~25 ms fade.
@@ -132,6 +140,34 @@ namespace WDE.PedalGainMulti
             ValueDescriptor = Descriptors.Milliseconds)]
         public int Inertia { get; set; } = 25;
 
+        // ── Per-input mute switches ──────────────────────────────────────────
+        // Declared LAST so older songs (which had no per-input mutes) load
+        // with all of these at DefValue=0 (= not muted). Each shares the
+        // global Inertia value; the ramp lives inside Work() alongside the
+        // output mute's ramp.
+        //
+        // Note: the params window will show "Mute" (output) followed later
+        // by "Mute 1".."Mute 6". The descriptions disambiguate; in the GUI
+        // the per-input buttons sit in the IN section and the output button
+        // in the OUT section, so there's no visual ambiguity in normal use.
+        [ParameterDecl(Name = "Mute 1", Description = "Mute input 1", DefValue = 0)]
+        public bool InMute1 { get => InMute[0]; set => InMute[0] = value; }
+
+        [ParameterDecl(Name = "Mute 2", Description = "Mute input 2", DefValue = 0)]
+        public bool InMute2 { get => InMute[1]; set => InMute[1] = value; }
+
+        [ParameterDecl(Name = "Mute 3", Description = "Mute input 3", DefValue = 0)]
+        public bool InMute3 { get => InMute[2]; set => InMute[2] = value; }
+
+        [ParameterDecl(Name = "Mute 4", Description = "Mute input 4", DefValue = 0)]
+        public bool InMute4 { get => InMute[3]; set => InMute[3] = value; }
+
+        [ParameterDecl(Name = "Mute 5", Description = "Mute input 5", DefValue = 0)]
+        public bool InMute5 { get => InMute[4]; set => InMute[4] = value; }
+
+        [ParameterDecl(Name = "Mute 6", Description = "Mute input 6", DefValue = 0)]
+        public bool InMute6 { get => InMute[5]; set => InMute[5] = value; }
+
         // ── Construction ─────────────────────────────────────────────────────
         public PedalGainMultiMachine(IBuzzMachineHost host)
         {
@@ -190,6 +226,25 @@ namespace WDE.PedalGainMulti
 
             float g = Gain * 0.01f;   // 0..200 → 0..2.0 linear
 
+            // Per-sample step for a linear fade of length `Inertia` ms. Used
+            // by BOTH the per-input mute ramps and the output mute ramp —
+            // single source of truth for fade time.
+            // Inertia=0 (or no sample rate yet) → snap to target in one sample.
+            float fadeSeconds = Inertia * 0.001f;
+            float muteStep = (fadeSeconds > 0f && cachedSr > 0)
+                ? 1f / (cachedSr * fadeSeconds)
+                : 1f;
+
+            // First-Work snap for per-input mute gains, mirroring what we do
+            // for the output mute below. Without this, loading a song where
+            // some inputs are pre-muted would fade-down on song start.
+            if (!inMuteInitialized)
+            {
+                for (int i = 0; i < NumInputs; i++)
+                    currentInMuteGain[i] = InMute[i] ? 0f : 1f;
+                inMuteInitialized = true;
+            }
+
             // 1. Zero the output buffer.
             for (int s = 0; s < n; s++)
             {
@@ -198,15 +253,18 @@ namespace WDE.PedalGainMulti
             }
 
             // Is any input soloed? If so, only soloed inputs route to output.
-            // If nothing is soloed, behaviour is unchanged from before.
+            // Per-input mute still applies — mute beats solo (DAW convention).
             bool anySolo = false;
             for (int i = 0; i < NumInputs; i++)
                 if (Solo[i]) { anySolo = true; break; }
 
-            // 2. Walk every input slot — sum audible ones into the output,
-            //    compute per-input peak for the meter (always — solo doesn't
-            //    hide the input level, only its contribution to the mix),
-            //    and let disconnected slots fade their meter to zero.
+            // 2. Walk every input slot — ramp its per-input mute, sum its
+            //    contribution into the output (gated by solo), and update its
+            //    meter from the RAW signal (pre-mute, pre-solo) so the meter
+            //    answers "is there signal arriving?" rather than "what's
+            //    reaching the mix?". Disconnected slots fade the meter to
+            //    zero and snap the per-input mute gain to its target so a
+            //    later reconnect doesn't glitch.
             bool anyInput = false;
             int inCount = input?.Count ?? 0;
             for (int i = 0; i < NumInputs; i++)
@@ -215,64 +273,57 @@ namespace WDE.PedalGainMulti
                 if (inBuf == null)
                 {
                     MeterIn[i] = MeterIn[i] * decay;
+                    currentInMuteGain[i] = InMute[i] ? 0f : 1f;
                     continue;
                 }
                 anyInput = true;
 
                 float p = 0f;
-                bool muted = anySolo && !Solo[i];
+                float effSoloGain = (anySolo && !Solo[i]) ? 0f : 1f;
+                float inTarget = InMute[i] ? 0f : 1f;
+                float inGain = currentInMuteGain[i];
 
-                if (muted)
+                // One unified loop: ramp per sample, multiply by inGain (and
+                // by the solo gate), accumulate into output, collect raw peak
+                // for the meter. When solo-muted, effSoloGain is 0 and the
+                // adds are no-ops, but the ramp still progresses so flipping
+                // mute or solo never produces a stale-gain glitch.
+                for (int s = 0; s < n; s++)
                 {
-                    // Meter only — don't contribute to the mix.
-                    for (int s = 0; s < n; s++)
-                    {
-                        float l = inBuf[s].L, r = inBuf[s].R;
-                        float a = MathF.Max(l < 0f ? -l : l, r < 0f ? -r : r);
-                        if (a > p) p = a;
-                    }
+                    float l = inBuf[s].L;
+                    float r = inBuf[s].R;
+
+                    if (inGain < inTarget)
+                        inGain = MathF.Min(inGain + muteStep, inTarget);
+                    else if (inGain > inTarget)
+                        inGain = MathF.Max(inGain - muteStep, inTarget);
+
+                    float effG = inGain * effSoloGain;
+                    outBuf[s].L += l * effG;
+                    outBuf[s].R += r * effG;
+
+                    float a = MathF.Max(l < 0f ? -l : l, r < 0f ? -r : r);
+                    if (a > p) p = a;
                 }
-                else
-                {
-                    // Audible — sum into output AND feed the meter.
-                    for (int s = 0; s < n; s++)
-                    {
-                        float l = inBuf[s].L, r = inBuf[s].R;
-                        outBuf[s].L += l;
-                        outBuf[s].R += r;
-                        float a = MathF.Max(l < 0f ? -l : l, r < 0f ? -r : r);
-                        if (a > p) p = a;
-                    }
-                }
-                // Instant attack, exponential release — normalized to 0 dBFS = 1.
+
+                currentInMuteGain[i] = inGain;
                 MeterIn[i] = MathF.Max(p / FULL_SCALE, MeterIn[i] * decay);
             }
 
-            // 3. Apply gain × mute-ramp and collect per-channel output peaks.
-            //
-            //    The mute ramp lives here (rather than as a separate pass)
-            //    because it folds into the same per-sample multiply that the
-            //    gain stage already needs. On the first Work() call after
-            //    construction we snap to the target so song-loaded mutes
-            //    don't produce a fade-down on startup.
+            // 3. Apply Gain × output-mute-ramp and collect per-channel output
+            //    peaks. Same single-multiply-per-sample shape as the per-input
+            //    stage above. On the first Work() call we snap the output mute
+            //    gain to its target so song-loaded mutes don't fade-down.
             float targetMuteGain = Mute ? 0f : 1f;
             if (!muteInitialized)
             {
-                currentMuteGain  = targetMuteGain;
-                muteInitialized  = true;
+                currentMuteGain = targetMuteGain;
+                muteInitialized = true;
             }
-
-            // Per-sample step for a linear fade of length `Inertia` ms.
-            // Inertia=0 (or no sample rate yet) → snap to target in one sample.
-            float fadeSeconds = Inertia * 0.001f;
-            float muteStep = (fadeSeconds > 0f && cachedSr > 0)
-                ? 1f / (cachedSr * fadeSeconds)
-                : 1f;
 
             float peakL = 0f, peakR = 0f;
             for (int s = 0; s < n; s++)
             {
-                // Inertia ramp toward target.
                 if (currentMuteGain < targetMuteGain)
                     currentMuteGain = MathF.Min(currentMuteGain + muteStep, targetMuteGain);
                 else if (currentMuteGain > targetMuteGain)
