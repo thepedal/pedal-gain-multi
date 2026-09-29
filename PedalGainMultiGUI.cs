@@ -1,41 +1,36 @@
-// Pedal Gain Multi — Machine GUI (code-only WPF, no XAML)
+// Pedal Gain Multi — parameter panel (v2.0.0)
 //
-// Renders a compact meter stack at the top of the parameters window:
+// Code-only WPF (no XAML — avoids BAML loading issues in ReBuzz).
 //
-//   IN
-//   [M][S] 1 ████████████░░░░░░░░  -12.3 dB
-//   [M][S] 2 ██████░░░░░░░░░░░░░░  -18.1 dB
-//   [M][S] 3 ░░░░░░░░░░░░░░░░░░░░      -∞
-//   [M][S] 4 ░░░░░░░░░░░░░░░░░░░░      -∞
-//   [M][S] 5 ░░░░░░░░░░░░░░░░░░░░      -∞
-//   [M][S] 6 ░░░░░░░░░░░░░░░░░░░░      -∞
-//   ──────────────────────────────
-//   [M]    OUT
-//          L ██████████░░░░░░░░░░  -14.2 dB
-//          R ██████████░░░░░░░░░░  -14.5 dB
-//                     -48 -24 -12 -6 -3 0
+//   IN                                   PRE    VOL    PAN  MO
+//   [M][S] 0 ████████░░░░░░  -12.3   [====|==]  [==|==] [MO]
+//   [M][S] 1 ████░░░░░░░░░░  -18.1   [===|===]  [==|==] [MO]
+//   ...                                   − +
+//   [M] OUT (MASTER, TRUE PEAK)          [====|==]  [ METERS ]
+//       L ██████████░░░░░░  -14.2
+//       R ██████████░░░░░░  -14.5
+//             -40 -30 -20 -12 -6 -3 0
 //
-// [M] mute buttons (red when on) toggle the Mute / Mute{N} switch
-// parameters; [S] solo buttons (amber when on) toggle Solo{N} switch
-// parameters. The per-input [M]s align vertically with the output [M]
-// — all mutes stack in column 0. Per-input mutes ramp at the same rate
-// as the output mute (set by the global Inertia parameter, 0–500 ms,
-// default 25) and follow the DAW convention of mute beating solo.
+// Everything is driven from the machine's parameters through
+// IParameter.SetValue / GetValue, so undo, pattern automation and song
+// saving all stay consistent — the panel never writes machine fields
+// directly.
 //
-// All parameter writes go through IParameter.SetValue so the GUI, params
-// window, pattern editor, undo and save/load stay in sync.
-//
-// Meter ballistics run on the audio thread (see PedalGainMultiMachine.Work);
-// this GUI just reads volatile values on a 33 ms timer.
+// Meters poll PedalGainMultiMachine.TakeMeters(0) on a DispatcherTimer.
+// That polling is also what keeps the machine's analysis gate open (see
+// the machine's "Analysis gating" section): a closed panel costs the
+// audio thread almost nothing.
 
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
-using Buzz.MachineInterface;
 using BuzzGUI.Interfaces;
 
 namespace WDE.PedalGainMulti
@@ -47,9 +42,43 @@ namespace WDE.PedalGainMulti
 
     public class PedalGainMultiGUI : UserControl, IMachineGUI
     {
-        // Sized at compile time from the machine's NumInputs const.
-        const int NumInputs = PedalGainMultiMachine.NumInputs;
+        // ── Layout constants (DIP), from the handoff ─────────────────────────
+        const double ColMute    = 14;
+        const double ColSolo    = 14;
+        const double ColNum     = 18;
+        const double ColMeter   = 200;
+        const double ColReadout = 46;
+        const double ColVol     = 70;
+        const double ColPan     = 38;
+        const double ColMono    = 26;
+        const double RowHeight  = 13;
+        const double BarHeight  = 9;
 
+        // ── Palette ──────────────────────────────────────────────────────────
+        static readonly Brush BgTrack    = Frozen(Color.FromRgb(34, 34, 38));
+        static readonly Brush BgButton   = Frozen(Color.FromRgb(44, 44, 50));
+        static readonly Brush BorderCol  = Frozen(Color.FromRgb(70, 70, 80));
+        static readonly Brush FgDim      = Frozen(Color.FromRgb(130, 130, 140));
+        static readonly Brush FgNormal   = Frozen(Color.FromRgb(170, 170, 180));
+        static readonly Brush FgSection  = Frozen(Color.FromRgb(120, 120, 135));
+        static readonly Brush FgScale    = Frozen(Color.FromRgb(95, 95, 105));
+        static readonly Brush Separator  = Frozen(Color.FromRgb(60, 60, 68));
+        static readonly Brush SoloOnBg   = Frozen(Color.FromRgb(235, 185, 40));
+        static readonly Brush SoloOnFg   = Frozen(Color.FromRgb(20, 20, 25));
+        static readonly Brush MuteOnBg   = Frozen(Color.FromRgb(215, 55, 45));
+        static readonly Brush MuteOnFg   = Frozen(Color.FromRgb(245, 245, 245));
+        static readonly Brush MonoOnBg   = Frozen(Color.FromRgb(40, 170, 175));
+        static readonly Brush MonoOnFg   = Frozen(Color.FromRgb(15, 25, 28));
+        static readonly Brush HoldLine   = Frozen(Colors.White);
+        static readonly Brush ClipRed    = Frozen(Color.FromRgb(235, 60, 45));
+        static readonly Brush FaderTrack = Frozen(Color.FromRgb(28, 28, 32));
+        static readonly Brush FaderKnob  = Frozen(Color.FromRgb(150, 150, 162));
+        static readonly Brush FaderFill  = Frozen(Color.FromRgb(70, 90, 110));
+        static readonly FontFamily Mono  = new FontFamily("Consolas");
+
+        static Brush Frozen(Color c) { var b = new SolidColorBrush(c); b.Freeze(); return b; }
+
+        // ── Machine binding ──────────────────────────────────────────────────
         IMachine imachine;
         PedalGainMultiMachine machine;
 
@@ -58,504 +87,827 @@ namespace WDE.PedalGainMulti
             get => imachine;
             set
             {
+                if (imachine != null)
+                    imachine.PropertyChanged -= OnMachinePropertyChanged;
+
                 imachine = value;
                 machine  = value?.ManagedMachine as PedalGainMultiMachine;
+
+                if (imachine != null)
+                    imachine.PropertyChanged += OnMachinePropertyChanged;
+
+                RebuildChannelRows();
             }
         }
 
-        readonly DispatcherTimer timer;
-
-        // Per-input widgets
-        readonly Border[]    inMuteButtons = new Border[NumInputs];
-        readonly TextBlock[] inMuteLabels  = new TextBlock[NumInputs];
-        readonly Border[]    soloButtons   = new Border[NumInputs];
-        readonly TextBlock[] soloLabels    = new TextBlock[NumInputs];
-        readonly Rectangle[] inBars        = new Rectangle[NumInputs];
-        readonly Rectangle[] inPeakLines   = new Rectangle[NumInputs];
-        readonly TextBlock[] inDbTexts     = new TextBlock[NumInputs];
-        readonly float[]     inHoldDb      = new float[NumInputs];
-        readonly int[]       inHoldFrames  = new int[NumInputs];
-
-        // Output widgets
-        Rectangle barL,  barR;
-        Rectangle peakL, peakR;
-        TextBlock dbTextL, dbTextR;
-        float holdDbL = DB_MIN, holdDbR = DB_MIN;
-        int   holdFramesL,      holdFramesR;
-
-        // Mute widgets (single button gating the whole output)
-        Border    muteButton;
-        TextBlock muteLabel;
-
-        // ── Layout constants ─────────────────────────────────────────────────
-        const float MUTE_W    = 14f;   // per-input M button column
-        const float SOLO_W    = 14f;   // per-input S button column
-        const float LABEL_W   = 14f;
-        const float W         = 200f;
-        const float READOUT_W = 46f;
-        const float H         = 9f;
-        const float DB_MIN    = -60f;
-        const int   HOLD_FRAMES = 90;   // ~3 s at 33 ms/frame
-
-        // ── Cached, frozen brushes ───────────────────────────────────────────
-        static readonly Brush TrackBrush     = Freeze(new SolidColorBrush(Color.FromRgb(34,  34,  38)));
-        static readonly Brush PeakBrush      = Freeze(new SolidColorBrush(Colors.White));
-        static readonly Brush LabelColor     = Freeze(new SolidColorBrush(Color.FromRgb(170, 170, 180)));
-        static readonly Brush ScaleColor     = Freeze(new SolidColorBrush(Color.FromRgb(95,  95, 105)));
-        static readonly Brush SectionColor   = Freeze(new SolidColorBrush(Color.FromRgb(120, 120, 135)));
-        static readonly Brush SeparatorBrush = Freeze(new SolidColorBrush(Color.FromRgb(60,  60,  68)));
-
-        // Solo button — off state uses the track background so it reads as a
-        // "recessed" button; on state lights up amber with dark text.
-        static readonly Brush SoloOffBg   = Freeze(new SolidColorBrush(Color.FromRgb(44,  44,  50)));
-        static readonly Brush SoloOffFg   = Freeze(new SolidColorBrush(Color.FromRgb(130, 130, 140)));
-        static readonly Brush SoloOnBg    = Freeze(new SolidColorBrush(Color.FromRgb(235, 185,  40)));
-        static readonly Brush SoloOnFg    = Freeze(new SolidColorBrush(Color.FromRgb(20,  20,  25)));
-        static readonly Brush SoloBorder  = Freeze(new SolidColorBrush(Color.FromRgb(70,  70,  80)));
-
-        // Mute uses the same "off" recessed look but red when active —
-        // standard DAW colour convention (solo = yellow, mute = red).
-        static readonly Brush MuteOnBg    = Freeze(new SolidColorBrush(Color.FromRgb(215,  55,  45)));
-        static readonly Brush MuteOnFg    = Freeze(new SolidColorBrush(Color.FromRgb(245, 245, 245)));
-
-        static readonly FontFamily Mono = new FontFamily("Consolas");
-
-        static Brush Freeze(Brush b) { b.Freeze(); return b; }
-
-        // Green → yellow → red gradient with break points at -12 dB and -3 dB.
-        static LinearGradientBrush LevelGradient()
+        void OnMachinePropertyChanged(object sender, System.ComponentModel.PropertyChangedEventArgs e)
         {
-            float yp = Norm(-12f), rp = Norm(-3f);
-            var b = new LinearGradientBrush
-                { StartPoint = new Point(0, 0), EndPoint = new Point(1, 0) };
-            b.GradientStops.Add(new GradientStop(Color.FromRgb( 30, 175,  55), 0.0));
-            b.GradientStops.Add(new GradientStop(Color.FromRgb( 30, 175,  55), yp));
-            b.GradientStops.Add(new GradientStop(Color.FromRgb(205, 185,   0), yp));
-            b.GradientStops.Add(new GradientStop(Color.FromRgb(205, 185,   0), rp));
-            b.GradientStops.Add(new GradientStop(Color.FromRgb(215,  45,  30), rp));
-            b.GradientStops.Add(new GradientStop(Color.FromRgb(215,  45,  30), 1.0));
-            b.Freeze();
-            return b;
+            // Track count changes mean a different number of channel strips.
+            if (e.PropertyName == "TrackCount")
+                Dispatcher.BeginInvoke((Action)RebuildChannelRows);
         }
+
+        // ── Widgets ──────────────────────────────────────────────────────────
+        StackPanel     root;
+        StackPanel     channelHost;      // channel rows live here
+        readonly List<ChannelRow> rows = new List<ChannelRow>();
+
+        ToggleButtonLite masterMuteBtn;
+        MiniFader        masterFader;
+        ToggleButtonLite preFaderBtn;
+        MeterBar         outMeterL, outMeterR;
+        TextBlock        outReadoutL, outReadoutR;
+
+        readonly MeterBallistics outBallL = new MeterBallistics();
+        readonly MeterBallistics outBallR = new MeterBallistics();
+
+        // PRE shows the raw input peaks, POST shows them after the strip.
+        bool showPre;
+
+        readonly DispatcherTimer timer;
+        readonly Stopwatch       clock = new Stopwatch();
+        double                   lastTick;
+        bool                     firstReadDone;
 
         // ── Construction ─────────────────────────────────────────────────────
         public PedalGainMultiGUI()
         {
-            BuildUI();
+            BuildStaticUI();
+
+            clock.Start();
+            lastTick = clock.Elapsed.TotalSeconds;
+
             timer = new DispatcherTimer(DispatcherPriority.Render)
             {
                 Interval = TimeSpan.FromMilliseconds(33)   // ~30 fps
             };
-            timer.Tick += Tick;
+            timer.Tick += OnTick;
             timer.Start();
+
             Unloaded += (_, __) => timer.Stop();
+            Loaded   += (_, __) => { if (!timer.IsEnabled) timer.Start(); };
         }
 
-        // ── Layout helpers ───────────────────────────────────────────────────
+        // ── Static layout ────────────────────────────────────────────────────
 
-        // Every row shares this 5-column grid:
-        //   col 0 — per-input mute button [M] (empty on output L/R and scale rows;
-        //           the output mute button also lives here on its own header row)
-        //   col 1 — per-input solo button [S] (empty everywhere except input rows)
-        //   col 2 — label
-        //   col 3 — bar area (W px, the pixel-aligned meter column)
-        //   col 4 — dB readout
-        static Grid MakeRowGrid()
+        void BuildStaticUI()
         {
-            var g = new Grid();
-            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(MUTE_W)    });
-            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(SOLO_W)    });
-            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(LABEL_W)   });
-            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(W)         });
-            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(READOUT_W) });
-            return g;
-        }
+            root = new StackPanel { Margin = new Thickness(6, 5, 6, 5) };
 
-        void BuildUI()
-        {
-            var root = new StackPanel { Margin = new Thickness(6, 6, 6, 4) };
-            var grad = LevelGradient();
+            root.Children.Add(BuildInHeader());
 
-            root.Children.Add(SectionHeader("IN"));
+            channelHost = new StackPanel();
+            root.Children.Add(channelHost);
 
-            for (int i = 0; i < NumInputs; i++)
-            {
-                var grid = MakeRowGrid();
-                grid.Margin = new Thickness(0, 1, 0, 1);
-
-                // Col 0 — per-input mute button.
-                var (mbtn, mlbl) = MakeToggleButton(
-                    letter:    "M",
-                    tooltip:   $"Mute input {i + 1} (fade time = Inertia)",
-                    paramName: $"Mute {i + 1}",
-                    onBg:      MuteOnBg,
-                    onFg:      MuteOnFg);
-                Grid.SetColumn(mbtn, 0);
-                grid.Children.Add(mbtn);
-                inMuteButtons[i] = mbtn;
-                inMuteLabels[i]  = mlbl;
-
-                // Col 1 — solo button.
-                var (sbtn, slbl) = MakeToggleButton(
-                    letter:    "S",
-                    tooltip:   $"Solo input {i + 1}",
-                    paramName: $"Solo {i + 1}",
-                    onBg:      SoloOnBg,
-                    onFg:      SoloOnFg);
-                Grid.SetColumn(sbtn, 1);
-                grid.Children.Add(sbtn);
-                soloButtons[i] = sbtn;
-                soloLabels[i]  = slbl;
-
-                // Col 2 — input number label.
-                grid.Children.Add(RowLabel((i + 1).ToString(), col: 2));
-
-                // Col 3 — bar canvas + peak-hold line.
-                var (canvas, bar, peak) = BuildBarCanvas(grad);
-                Grid.SetColumn(canvas, 3);
-                grid.Children.Add(canvas);
-                inBars[i]      = bar;
-                inPeakLines[i] = peak;
-
-                // Col 4 — dB readout.
-                var db = RowReadout();
-                Grid.SetColumn(db, 4);
-                grid.Children.Add(db);
-                inDbTexts[i] = db;
-
-                inHoldDb[i]     = DB_MIN;
-                inHoldFrames[i] = 0;
-
-                root.Children.Add(grid);
-            }
-
-            // Thin separator — spans the bar area only for visual symmetry.
             root.Children.Add(new Rectangle
             {
-                Height              = 1,
-                Fill                = SeparatorBrush,
-                Margin              = new Thickness(MUTE_W + SOLO_W + LABEL_W, 5, READOUT_W, 3),
+                Height = 1,
+                Fill   = Separator,
+                Margin = new Thickness(ColMute + ColSolo + ColNum, 5, 0, 4),
                 HorizontalAlignment = HorizontalAlignment.Stretch
             });
 
-            // OUT header row: [M] mute button + "OUT" label, aligned to the
-            // same 4-column grid as the input rows so the mute button sits
-            // directly under the column of solo buttons above.
-            root.Children.Add(BuildOutHeaderRow());
-
-            (barL, peakL, dbTextL) = AddOutputRow(root, "L", grad);
-            (barR, peakR, dbTextR) = AddOutputRow(root, "R", grad);
-
-            root.Children.Add(MakeScaleRow());
+            root.Children.Add(BuildOutHeader());
+            root.Children.Add(BuildOutRow(true));
+            root.Children.Add(BuildOutRow(false));
+            root.Children.Add(BuildScaleRow());
 
             Content  = root;
-            MinWidth = MUTE_W + SOLO_W + LABEL_W + W + READOUT_W + 12;
+            MinWidth = ColMute + ColSolo + ColNum + ColMeter + ColReadout
+                     + ColVol + ColPan + ColMono + 16;
         }
 
-        static UIElement SectionHeader(string text)
+        // Shared 8-column grid so every row lines up exactly.
+        static Grid NewRowGrid()
         {
-            return new TextBlock
-            {
-                Text       = text,
-                FontFamily = Mono,
-                FontSize   = 8,
-                Foreground = SectionColor,
-                Margin     = new Thickness(0, 1, 0, 1)
-            };
+            var g = new Grid();
+            foreach (double w in new[] { ColMute, ColSolo, ColNum, ColMeter, ColReadout, ColVol, ColPan, ColMono })
+                g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(w) });
+            return g;
         }
 
-        // OUT section header row: mute button in col 0 + "OUT" label in col 2.
-        // The mute button stays in col 0 so it aligns vertically with the
-        // column of per-input [M] buttons above — visually all the mutes
-        // stack in the same column.
-        UIElement BuildOutHeaderRow()
-        {
-            var grid = MakeRowGrid();
-            grid.Margin = new Thickness(0, 1, 0, 1);
-
-            var (btn, btnLbl) = MakeToggleButton(
-                letter:    "M",
-                tooltip:   "Mute output (fade time = Inertia parameter)",
-                paramName: "Mute",
-                onBg:      MuteOnBg,
-                onFg:      MuteOnFg);
-            Grid.SetColumn(btn, 0);
-            grid.Children.Add(btn);
-            muteButton = btn;
-            muteLabel  = btnLbl;
-
-            // The "OUT" label lives in col 2, styled to match the IN header.
-            var hdr = new TextBlock
-            {
-                Text              = "OUT",
-                FontFamily        = Mono,
-                FontSize          = 8,
-                Foreground        = SectionColor,
-                VerticalAlignment = VerticalAlignment.Center
-            };
-            Grid.SetColumn(hdr, 2);
-            grid.Children.Add(hdr);
-
-            return grid;
-        }
-
-        static TextBlock RowLabel(string text, int col)
-        {
-            var lbl = new TextBlock
+        static TextBlock Label(string text, Brush fg, double size = 9, FontWeight? weight = null)
+            => new TextBlock
             {
                 Text              = text,
                 FontFamily        = Mono,
-                FontSize          = 10,
-                Foreground        = LabelColor,
+                FontSize          = size,
+                Foreground        = fg,
+                FontWeight        = weight ?? FontWeights.Normal,
                 VerticalAlignment = VerticalAlignment.Center
             };
-            Grid.SetColumn(lbl, col);
-            return lbl;
+
+        UIElement BuildInHeader()
+        {
+            var g = NewRowGrid();
+            g.Margin = new Thickness(0, 0, 0, 2);
+
+            var inLbl = Label("IN", FgSection, 8);
+            Grid.SetColumn(inLbl, 0);
+            Grid.SetColumnSpan(inLbl, 2);
+            g.Children.Add(inLbl);
+
+            // − / + track count buttons sit in the meter column, left-aligned.
+            var trackBtns = new StackPanel
+            {
+                Orientation         = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                VerticalAlignment   = VerticalAlignment.Center
+            };
+            trackBtns.Children.Add(MakeTinyButton("−", "Remove a channel", () => NudgeTrackCount(-1)));
+            trackBtns.Children.Add(MakeTinyButton("+", "Add a channel",    () => NudgeTrackCount(+1)));
+            Grid.SetColumn(trackBtns, 3);
+            g.Children.Add(trackBtns);
+
+            // PRE / POST toggle in the readout column.
+            preFaderBtn = new ToggleButtonLite("PRE", "Meter the input (PRE) or the post-fader signal (POST)")
+            {
+                Width = ColReadout - 4,
+                OnBg  = BgButton,
+                OnFg  = FgNormal
+            };
+            preFaderBtn.Clicked += () =>
+            {
+                showPre = !showPre;
+                preFaderBtn.Text = showPre ? "PRE" : "POST";
+            };
+            preFaderBtn.Text = "PRE";
+            showPre = true;
+            Grid.SetColumn(preFaderBtn, 4);
+            g.Children.Add(preFaderBtn);
+
+            var volCap = Label("VOL", FgSection, 8);
+            Grid.SetColumn(volCap, 5); g.Children.Add(volCap);
+            var panCap = Label("PAN", FgSection, 8);
+            Grid.SetColumn(panCap, 6); g.Children.Add(panCap);
+            var moCap  = Label("MO", FgSection, 8);
+            Grid.SetColumn(moCap, 7);  g.Children.Add(moCap);
+
+            return g;
         }
 
-        static TextBlock RowReadout() => new TextBlock
+        UIElement BuildOutHeader()
         {
-            Text              = "-∞",
-            Width             = READOUT_W - 2,
-            TextAlignment     = TextAlignment.Right,
-            FontFamily        = Mono,
-            FontSize          = 10,
-            Foreground        = LabelColor,
-            VerticalAlignment = VerticalAlignment.Center,
-            Margin            = new Thickness(4, 0, 0, 0)
-        };
+            var g = NewRowGrid();
+            g.Margin = new Thickness(0, 0, 0, 2);
 
-        // Build the bar canvas used by every meter row.
-        static (Canvas canvas, Rectangle bar, Rectangle peak)
-            BuildBarCanvas(Brush fill)
-        {
-            var canvas = new Canvas { Width = W, Height = H, ClipToBounds = true };
-
-            var track = new Rectangle
+            masterMuteBtn = new ToggleButtonLite("M", "Mute the master output")
             {
-                Width = W, Height = H, Fill = TrackBrush, RadiusX = 1.5, RadiusY = 1.5
+                OnBg = MuteOnBg, OnFg = MuteOnFg
             };
-            canvas.Children.Add(track);
+            masterMuteBtn.Clicked += () => ToggleGlobalSwitch("Master Mute");
+            Grid.SetColumn(masterMuteBtn, 0);
+            g.Children.Add(masterMuteBtn);
 
-            var bar = new Rectangle
+            var lbl = Label("OUT (MASTER, TRUE PEAK)", FgSection, 8);
+            Grid.SetColumn(lbl, 2);
+            Grid.SetColumnSpan(lbl, 3);
+            g.Children.Add(lbl);
+
+            masterFader = new MiniFader(isDbTaper: true)
             {
-                Width = 0, Height = H, Fill = fill, RadiusX = 1.5, RadiusY = 1.5
+                Width   = ColVol - 4,
+                ToolTip = "Master output level"
             };
-            Canvas.SetLeft(bar, 0);
-            Canvas.SetTop(bar, 0);
-            canvas.Children.Add(bar);
+            masterFader.ValueChanged += v => SetGlobal("Gain", v);
+            Grid.SetColumn(masterFader, 5);
+            g.Children.Add(masterFader);
 
-            var peak = new Rectangle
-            {
-                Width = 2, Height = H, Fill = PeakBrush, Opacity = 0
-            };
-            Canvas.SetTop(peak, 0);
-            canvas.Children.Add(peak);
+            var metersBtn = MakeWideButton("METERS", "Open the big meter window", OpenMeterWindow);
+            Grid.SetColumn(metersBtn, 6);
+            Grid.SetColumnSpan(metersBtn, 2);
+            g.Children.Add(metersBtn);
 
-            return (canvas, bar, peak);
+            return g;
         }
 
-        // Helper used for the output L / R rows — no toggle buttons, same
-        // grid so the bar column still aligns pixel-for-pixel with the
-        // input rows.
-        (Rectangle bar, Rectangle peak, TextBlock db)
-            AddOutputRow(Panel parent, string label, Brush fill)
+        UIElement BuildOutRow(bool left)
         {
-            var grid = MakeRowGrid();
-            grid.Margin = new Thickness(0, 1, 0, 1);
+            var g = NewRowGrid();
+            g.Margin = new Thickness(0, 1, 0, 1);
 
-            grid.Children.Add(RowLabel(label, col: 2));
+            var lbl = Label(left ? "L" : "R", FgNormal, 9);
+            Grid.SetColumn(lbl, 2);
+            g.Children.Add(lbl);
 
-            var (canvas, bar, peak) = BuildBarCanvas(fill);
-            Grid.SetColumn(canvas, 3);
-            grid.Children.Add(canvas);
+            var bar = new MeterBar();
+            Grid.SetColumn(bar, 3);
+            g.Children.Add(bar);
 
-            var db = RowReadout();
-            Grid.SetColumn(db, 4);
-            grid.Children.Add(db);
+            var readout = MakeReadout();
+            Grid.SetColumn(readout, 4);
+            g.Children.Add(readout);
 
-            parent.Children.Add(grid);
-            return (bar, peak, db);
+            if (left) { outMeterL = bar; outReadoutL = readout; }
+            else      { outMeterR = bar; outReadoutR = readout; }
+
+            bar.MouseLeftButtonDown += (_, e) => { ClearAllHolds(); e.Handled = true; };
+            return g;
         }
 
-        // Scale row re-uses MakeRowGrid so column 3 matches the bar widths
-        // pixel-for-pixel. Cols 0 / 1 / 2 / 4 stay empty.
-        UIElement MakeScaleRow()
+        UIElement BuildScaleRow()
         {
-            var grid = MakeRowGrid();
-            grid.Margin = new Thickness(0, 2, 0, 0);
+            var g = NewRowGrid();
+            g.Margin = new Thickness(0, 2, 0, 0);
 
-            var canvas = new Canvas { Width = W, Height = 11 };
-            Grid.SetColumn(canvas, 3);
-
-            int[] marks = { -48, -36, -24, -12, -6, -3, 0 };
+            var canvas = new Canvas { Width = ColMeter, Height = 10 };
+            int[] marks = { -40, -30, -20, -12, -6, -3, 0 };
             foreach (int db in marks)
             {
                 var t = new TextBlock
                 {
-                    Text       = db.ToString(),
+                    Text       = db.ToString(CultureInfo.InvariantCulture),
                     FontFamily = Mono,
-                    FontSize   = 8,
-                    Foreground = ScaleColor
+                    FontSize   = 7.5,
+                    Foreground = FgScale
                 };
-                // Rough centering offset by text length.
-                double halfW = db <= -10 ? 7 : db < 0 ? 5 : 2;
-                double x     = Norm(db) * W - halfW;
-                Canvas.SetLeft(t, x);
+                double halfW = db <= -10 ? 7 : (db < 0 ? 5 : 2);
+                Canvas.SetLeft(t, MeterScale.PanelFraction(db) * ColMeter - halfW);
                 canvas.Children.Add(t);
             }
-
-            grid.Children.Add(canvas);
-            return grid;
+            Grid.SetColumn(canvas, 3);
+            g.Children.Add(canvas);
+            return g;
         }
 
-        // ── Toggle buttons (used by both solo and mute) ──────────────────────
-
-        (Border border, TextBlock label)
-            MakeToggleButton(string letter, string tooltip, string paramName, Brush onBg, Brush onFg)
+        static TextBlock MakeReadout() => new TextBlock
         {
-            var text = new TextBlock
-            {
-                Text                = letter,
-                FontFamily          = Mono,
-                FontSize            = 9,
-                FontWeight          = FontWeights.Bold,
-                Foreground          = SoloOffFg,
-                HorizontalAlignment = HorizontalAlignment.Center,
-                VerticalAlignment   = VerticalAlignment.Center
-            };
+            Text              = "-∞",
+            Width             = ColReadout - 3,
+            TextAlignment     = TextAlignment.Right,
+            FontFamily        = Mono,
+            FontSize          = 9,
+            Foreground        = FgNormal,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin            = new Thickness(0, 0, 3, 0)
+        };
 
-            var btn = new Border
+        Border MakeTinyButton(string text, string tip, Action onClick)
+        {
+            var b = new Border
             {
-                // MUTE_W == SOLO_W, so the same button width works in both
-                // columns. Two-pixel padding keeps the buttons visually
-                // separated when they sit side-by-side in an input row.
-                Width               = SOLO_W - 2,
-                Height              = H,
-                Background          = SoloOffBg,
-                BorderBrush         = SoloBorder,
+                Width               = 14,
+                Height              = BarHeight,
+                Background          = BgButton,
+                BorderBrush         = BorderCol,
                 BorderThickness     = new Thickness(1),
                 CornerRadius        = new CornerRadius(2),
-                Child               = text,
                 Cursor              = Cursors.Hand,
-                ToolTip             = tooltip,
+                ToolTip             = tip,
+                Margin              = new Thickness(0, 0, 3, 0),
                 VerticalAlignment   = VerticalAlignment.Center,
-                HorizontalAlignment = HorizontalAlignment.Left,
-                // Stash the on-colours on the button itself so the tick can
-                // recolour without needing a parallel data structure.
-                Tag                 = new ToggleColors(onBg, onFg)
-            };
-
-            btn.MouseLeftButtonDown += (_, e) =>
-            {
-                ToggleParameter(paramName);
-                e.Handled = true;
-            };
-
-            return (btn, text);
-        }
-
-        // Holds the per-button "on" colours so RefreshToggleVisual can recolour
-        // any button uniformly. Off colours are shared (SoloOffBg / SoloOffFg).
-        sealed class ToggleColors
-        {
-            public readonly Brush OnBg, OnFg;
-            public ToggleColors(Brush onBg, Brush onFg) { OnBg = onBg; OnFg = onFg; }
-        }
-
-        static void RefreshToggleVisual(Border btn, TextBlock label, bool on)
-        {
-            var c = (ToggleColors)btn.Tag;
-            btn.Background   = on ? c.OnBg : SoloOffBg;
-            label.Foreground = on ? c.OnFg : SoloOffFg;
-        }
-
-        // Flip a named bool parameter via the ReBuzz parameter API. Going
-        // through IParameter.SetValue (rather than writing the property
-        // directly) keeps the GUI, params window, pattern editor, undo and
-        // save/load all consistent.
-        void ToggleParameter(string name)
-        {
-            if (imachine?.ParameterGroups == null) return;
-
-            foreach (var pg in imachine.ParameterGroups)
-            {
-                if (pg?.Parameters == null) continue;
-                foreach (var p in pg.Parameters)
+                Child = new TextBlock
                 {
-                    if (p?.Name != name) continue;
-                    int cur = p.GetValue(0);
-                    p.SetValue(0, cur == 0 ? 1 : 0);
-                    return;
+                    Text                = text,
+                    FontFamily          = Mono,
+                    FontSize            = 9,
+                    Foreground          = FgNormal,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment   = VerticalAlignment.Center
                 }
+            };
+            b.MouseLeftButtonDown += (_, e) => { onClick(); e.Handled = true; };
+            return b;
+        }
+
+        Border MakeWideButton(string text, string tip, Action onClick)
+        {
+            var b = new Border
+            {
+                Height              = BarHeight,
+                Background          = BgButton,
+                BorderBrush         = BorderCol,
+                BorderThickness     = new Thickness(1),
+                CornerRadius        = new CornerRadius(2),
+                Cursor              = Cursors.Hand,
+                ToolTip             = tip,
+                Margin              = new Thickness(2, 0, 0, 0),
+                VerticalAlignment   = VerticalAlignment.Center,
+                Child = new TextBlock
+                {
+                    Text                = text,
+                    FontFamily          = Mono,
+                    FontSize            = 7.5,
+                    Foreground          = FgNormal,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment   = VerticalAlignment.Center
+                }
+            };
+            b.MouseLeftButtonDown += (_, e) => { onClick(); e.Handled = true; };
+            return b;
+        }
+
+        // ── Channel rows ─────────────────────────────────────────────────────
+
+        sealed class ChannelRow
+        {
+            public int              Track;
+            public ToggleButtonLite Mute;
+            public ToggleButtonLite Solo;
+            public ToggleButtonLite MonoBtn;
+            public MeterBar         Meter;
+            public TextBlock        Readout;
+            public MiniFader        Vol;
+            public MiniFader        Pan;
+            public MeterBallistics  Ball = new MeterBallistics();
+        }
+
+        void RebuildChannelRows()
+        {
+            if (channelHost == null) return;
+
+            channelHost.Children.Clear();
+            rows.Clear();
+
+            // Core §5 warns that IMachine.TrackCount reads 0 for control
+            // machines. This is an effect so it should be honest, but a 0
+            // would leave the panel with no strips at all — fall back to the
+            // default rather than render an empty mixer.
+            int n = imachine?.TrackCount ?? 0;
+            if (n < 1) n = PedalGainMultiMachine.DefTracks;
+            if (n > PedalGainMultiMachine.MaxTracks) n = PedalGainMultiMachine.MaxTracks;
+
+            for (int t = 0; t < n; t++)
+                channelHost.Children.Add(BuildChannelRow(t));
+
+            RefreshControlsFromParameters();
+        }
+
+        UIElement BuildChannelRow(int track)
+        {
+            var row = new ChannelRow { Track = track };
+            var g   = NewRowGrid();
+            g.Margin = new Thickness(0, 1, 0, 1);
+
+            row.Mute = new ToggleButtonLite("M", $"Mute input {track}")
+            {
+                OnBg = MuteOnBg, OnFg = MuteOnFg
+            };
+            row.Mute.Clicked += () => ToggleTrackSwitch("Mute", track);
+            Grid.SetColumn(row.Mute, 0);
+            g.Children.Add(row.Mute);
+
+            row.Solo = new ToggleButtonLite("S", $"Solo input {track}")
+            {
+                OnBg = SoloOnBg, OnFg = SoloOnFg
+            };
+            row.Solo.Clicked += () => ToggleTrackSwitch("Solo", track);
+            Grid.SetColumn(row.Solo, 1);
+            g.Children.Add(row.Solo);
+
+            var num = Label(track.ToString(CultureInfo.InvariantCulture), FgNormal, 9);
+            num.ToolTip = $"In {track} (track {track}) — its direct out is output plug {track + 1}";
+            Grid.SetColumn(num, 2);
+            g.Children.Add(num);
+
+            row.Meter = new MeterBar();
+            row.Meter.MouseLeftButtonDown += (_, e) => { ClearAllHolds(); e.Handled = true; };
+            Grid.SetColumn(row.Meter, 3);
+            g.Children.Add(row.Meter);
+
+            row.Readout = MakeReadout();
+            Grid.SetColumn(row.Readout, 4);
+            g.Children.Add(row.Readout);
+
+            row.Vol = new MiniFader(isDbTaper: true)
+            {
+                Width   = ColVol - 4,
+                ToolTip = $"Level for input {track}"
+            };
+            int capturedTrack = track;
+            row.Vol.ValueChanged += v => SetTrack("Volume", capturedTrack, v);
+            Grid.SetColumn(row.Vol, 5);
+            g.Children.Add(row.Vol);
+
+            row.Pan = new MiniFader(isDbTaper: false)
+            {
+                Width    = ColPan - 4,
+                MinValue = 0,
+                MaxValue = 128,
+                DefValue = 64,
+                ToolTip  = $"Pan for input {track}"
+            };
+            row.Pan.ValueChanged += v => SetTrack("Pan", capturedTrack, v);
+            Grid.SetColumn(row.Pan, 6);
+            g.Children.Add(row.Pan);
+
+            row.MonoBtn = new ToggleButtonLite("MO", $"Sum input {track} to mono")
+            {
+                OnBg = MonoOnBg, OnFg = MonoOnFg, Width = ColMono - 4
+            };
+            row.MonoBtn.Clicked += () => ToggleTrackSwitch("Mono", capturedTrack);
+            Grid.SetColumn(row.MonoBtn, 7);
+            g.Children.Add(row.MonoBtn);
+
+            rows.Add(row);
+            return g;
+        }
+
+        // ── Parameter access ─────────────────────────────────────────────────
+        //
+        // Always through IParameter so undo, patterns and saving stay
+        // consistent. Parameters are looked up by group type + name rather
+        // than by index, so adding a parameter later can't silently shift
+        // which control drives what.
+
+        IParameter FindParam(ParameterGroupType groupType, string name)
+        {
+            var groups = imachine?.ParameterGroups;
+            if (groups == null) return null;
+            foreach (var g in groups)
+            {
+                if (g == null || g.Type != groupType || g.Parameters == null) continue;
+                foreach (var p in g.Parameters)
+                    if (p != null && p.Name == name) return p;
+            }
+            return null;
+        }
+
+        IParameter GlobalParam(string name) => FindParam(ParameterGroupType.Global, name);
+        IParameter TrackParam (string name) => FindParam(ParameterGroupType.Track,  name);
+
+        void SetGlobal(string name, int value)
+        {
+            var p = GlobalParam(name);
+            if (p != null) p.SetValue(0, value);
+        }
+
+        void SetTrack(string name, int track, int value)
+        {
+            var p = TrackParam(name);
+            if (p != null) p.SetValue(track, value);
+        }
+
+        void ToggleGlobalSwitch(string name)
+        {
+            var p = GlobalParam(name);
+            if (p == null) return;
+            p.SetValue(0, p.GetValue(0) == 0 ? 1 : 0);
+        }
+
+        void ToggleTrackSwitch(string name, int track)
+        {
+            var p = TrackParam(name);
+            if (p == null) return;
+            p.SetValue(track, p.GetValue(track) == 0 ? 1 : 0);
+        }
+
+        int GetGlobal(string name, int fallback)
+        {
+            var p = GlobalParam(name);
+            return p != null ? p.GetValue(0) : fallback;
+        }
+
+        int GetTrack(string name, int track, int fallback)
+        {
+            var p = TrackParam(name);
+            return p != null ? p.GetValue(track) : fallback;
+        }
+
+        void NudgeTrackCount(int delta)
+        {
+            if (imachine == null) return;
+            int n = Math.Clamp(imachine.TrackCount + delta, 1, PedalGainMultiMachine.MaxTracks);
+            if (n != imachine.TrackCount) imachine.TrackCount = n;
+        }
+
+        // Pull every control's state back from the parameters. Cheap enough
+        // to run every tick — it's a handful of dictionary reads — and means
+        // pattern automation and undo are reflected without extra plumbing.
+        void RefreshControlsFromParameters()
+        {
+            if (imachine == null) return;
+
+            masterMuteBtn?.SetState(GetGlobal("Master Mute", 0) != 0);
+            if (masterFader != null && !masterFader.IsDragging)
+                masterFader.SetValueSilent(GetGlobal("Gain", 161));
+
+            foreach (var r in rows)
+            {
+                r.Mute   ?.SetState(GetTrack("Mute", r.Track, 0) != 0);
+                r.Solo   ?.SetState(GetTrack("Solo", r.Track, 0) != 0);
+                r.MonoBtn?.SetState(GetTrack("Mono", r.Track, 0) != 0);
+
+                if (r.Vol != null && !r.Vol.IsDragging)
+                    r.Vol.SetValueSilent(GetTrack("Volume", r.Track, 161));
+                if (r.Pan != null && !r.Pan.IsDragging)
+                    r.Pan.SetValueSilent(GetTrack("Pan", r.Track, 64));
             }
         }
 
-        // ── Meter math ───────────────────────────────────────────────────────
+        // ── Meter polling ────────────────────────────────────────────────────
 
-        // Map a dBFS value to a 0→1 position (used by both bars and scale).
-        static float Norm(float db) =>
-            Math.Clamp((db - DB_MIN) / -DB_MIN, 0f, 1f);
-
-        static float LinToDb(float lin) =>
-            lin < 1e-6f ? DB_MIN : 20f * MathF.Log10(lin);
-
-        // Format a dB value for the meter readout. -∞ is shown when the
-        // value is at or below the noise floor. Used to display the held
-        // peak (UpdateHold tracks its value in dB, not linear).
-        static string FormatDb(float db) =>
-            db <= DB_MIN + 0.5f ? "-∞" : $"{db:F1}";
-
-        void SetBar(Rectangle bar, float lin)
-        {
-            bar.Width = Math.Clamp(Norm(LinToDb(lin)) * W, 0f, W);
-        }
-
-        void UpdateHold(ref float holdDb, ref int frames, float currentDb, Rectangle line)
-        {
-            if (currentDb >= holdDb) { holdDb = currentDb; frames = 0; }
-            else if (++frames > HOLD_FRAMES)
-                holdDb = MathF.Max(holdDb - 0.4f, DB_MIN);
-
-            Canvas.SetLeft(line, Math.Clamp(Norm(holdDb) * W - 1f, 0f, W - 2f));
-            line.Opacity = holdDb > DB_MIN + 0.5f ? 1.0 : 0.0;
-        }
-
-        // ── Timer tick ───────────────────────────────────────────────────────
-        void Tick(object sender, EventArgs e)
+        void OnTick(object sender, EventArgs e)
         {
             if (machine == null) return;
 
-            // Per-input meters + solo / mute button state.
-            for (int i = 0; i < NumInputs; i++)
-            {
-                float v = machine.MeterIn[i];
-                SetBar(inBars[i], v);
-                UpdateHold(ref inHoldDb[i], ref inHoldFrames[i], LinToDb(v), inPeakLines[i]);
-                inDbTexts[i].Text = FormatDb(inHoldDb[i]);
+            double now = clock.Elapsed.TotalSeconds;
+            float  dt  = (float)(now - lastTick);
+            lastTick = now;
 
-                // Refresh toggle buttons — machine.Solo[] and machine.InMute[]
-                // are the source of truth, updated by ReBuzz when the matching
-                // parameter changes (via our click handler, the pattern editor,
-                // or a song load).
-                RefreshToggleVisual(inMuteButtons[i], inMuteLabels[i], machine.InMute[i]);
-                RefreshToggleVisual(soloButtons[i],   soloLabels[i],   machine.Solo[i]);
+            RefreshControlsFromParameters();
+
+            var snap = machine.TakeMeters(0);
+            if (snap == null) return;
+
+            // The first read after the panel opens can carry peaks from long
+            // before it was visible — discard it so the meters don't slam.
+            if (!firstReadDone) { firstReadDone = true; return; }
+
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var r = rows[i];
+                if (r.Track >= snap.PrePeak.Length) continue;
+
+                float peak = showPre ? snap.PrePeak[r.Track] : snap.PostPeak[r.Track];
+                r.Ball.Update(peak, dt);
+                r.Meter.SetLevel(r.Ball.LevelDb, r.Ball.HoldDb, r.Ball.Clipped);
+                r.Readout.Text       = FormatDb(r.Ball.HoldDb);
+                r.Readout.Foreground = r.Ball.Clipped ? ClipRed : FgNormal;
             }
 
-            // Mute button — same source-of-truth pattern.
-            RefreshToggleVisual(muteButton, muteLabel, machine.Mute);
+            // Master rows show TRUE peak, not sample peak.
+            outBallL.Update(snap.TpL, dt);
+            outBallR.Update(snap.TpR, dt);
+            outMeterL.SetLevel(outBallL.LevelDb, outBallL.HoldDb, outBallL.Clipped);
+            outMeterR.SetLevel(outBallR.LevelDb, outBallR.HoldDb, outBallR.Clipped);
+            outReadoutL.Text       = FormatDb(outBallL.HoldDb);
+            outReadoutR.Text       = FormatDb(outBallR.HoldDb);
+            outReadoutL.Foreground = outBallL.Clipped ? ClipRed : FgNormal;
+            outReadoutR.Foreground = outBallR.Clipped ? ClipRed : FgNormal;
+        }
 
-            // Stereo output meter — hold-synchronized readout.
-            float l = machine.MeterL;
-            float r = machine.MeterR;
+        void ClearAllHolds()
+        {
+            foreach (var r in rows) r.Ball.ClearHold();
+            outBallL.ClearHold();
+            outBallR.ClearHold();
+        }
 
-            SetBar(barL, l);
-            UpdateHold(ref holdDbL, ref holdFramesL, LinToDb(l), peakL);
-            dbTextL.Text = FormatDb(holdDbL);
+        static string FormatDb(float db)
+        {
+            if (db <= MeterBallistics.MinDb + 0.5f) return "-∞";
+            string s = db.ToString("0.0", CultureInfo.InvariantCulture);
+            return (db > 0f ? "+" : "") + s;
+        }
 
-            SetBar(barR, r);
-            UpdateHold(ref holdDbR, ref holdFramesR, LinToDb(r), peakR);
-            dbTextR.Text = FormatDb(holdDbR);
+        void OpenMeterWindow()
+        {
+            PedalGainMultiMeterWindow.ShowFor(imachine, machine);
+        }
+
+        // ── MeterBar ─────────────────────────────────────────────────────────
+        //
+        // One horizontal bar: track, gradient-filled level, white hold line,
+        // red clip cap at the right end.
+        sealed class MeterBar : Canvas
+        {
+            readonly Rectangle track;
+            readonly Rectangle fill;
+            readonly Rectangle hold;
+            readonly Rectangle clip;
+
+            public MeterBar()
+            {
+                Width  = ColMeter;
+                Height = BarHeight;
+                ClipToBounds = true;
+                Background   = Brushes.Transparent;   // so clicks register
+
+                track = new Rectangle
+                {
+                    Width = ColMeter, Height = BarHeight,
+                    Fill  = BgTrack, RadiusX = 1.5, RadiusY = 1.5
+                };
+                Children.Add(track);
+
+                // Absolute gradient over the FULL bar length — mapping it to
+                // the lit portion instead is the v1.6.2 bug that made quiet
+                // signals show red.
+                fill = new Rectangle
+                {
+                    Width = 0, Height = BarHeight,
+                    Fill  = MeterScale.CreateGradient(ColMeter),
+                    RadiusX = 1.5, RadiusY = 1.5
+                };
+                SetLeft(fill, 0); SetTop(fill, 0);
+                Children.Add(fill);
+
+                hold = new Rectangle { Width = 2, Height = BarHeight, Fill = HoldLine, Opacity = 0 };
+                SetTop(hold, 0);
+                Children.Add(hold);
+
+                clip = new Rectangle { Width = 3, Height = BarHeight, Fill = ClipRed, Opacity = 0 };
+                SetLeft(clip, ColMeter - 3); SetTop(clip, 0);
+                Children.Add(clip);
+            }
+
+            public void SetLevel(float levelDb, float holdDb, bool clipped)
+            {
+                fill.Width = Math.Clamp(MeterScale.PanelFraction(levelDb) * ColMeter, 0, ColMeter);
+
+                if (holdDb > MeterBallistics.MinDb + 0.5f)
+                {
+                    SetLeft(hold, Math.Clamp(MeterScale.PanelFraction(holdDb) * ColMeter - 1, 0, ColMeter - 2));
+                    hold.Opacity = 1;
+                }
+                else hold.Opacity = 0;
+
+                clip.Opacity = clipped ? 1 : 0;
+            }
+        }
+
+        // ── ToggleButtonLite ─────────────────────────────────────────────────
+        //
+        // A small latching button. State is always pushed in from the
+        // parameters (SetState) rather than tracked locally, so pattern
+        // automation and undo stay authoritative.
+        sealed class ToggleButtonLite : Border
+        {
+            readonly TextBlock label;
+            bool state;
+
+            public Brush OnBg { get; set; } = Brushes.Orange;
+            public Brush OnFg { get; set; } = Brushes.Black;
+
+            public string Text
+            {
+                get => label.Text;
+                set => label.Text = value;
+            }
+
+            public event Action Clicked;
+
+            public ToggleButtonLite(string text, string tip)
+            {
+                label = new TextBlock
+                {
+                    Text                = text,
+                    FontFamily          = Mono,
+                    FontSize            = 8,
+                    FontWeight          = FontWeights.Bold,
+                    Foreground          = FgDim,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment   = VerticalAlignment.Center
+                };
+
+                Width             = ColMute - 2;
+                Height            = BarHeight;
+                Background        = BgButton;
+                BorderBrush       = BorderCol;
+                BorderThickness   = new Thickness(1);
+                CornerRadius      = new CornerRadius(2);
+                Cursor            = Cursors.Hand;
+                ToolTip           = tip;
+                VerticalAlignment = VerticalAlignment.Center;
+                HorizontalAlignment = HorizontalAlignment.Left;
+                Child             = label;
+
+                MouseLeftButtonDown += (_, e) => { Clicked?.Invoke(); e.Handled = true; };
+            }
+
+            public void SetState(bool on)
+            {
+                if (on == state) return;      // avoid pointless brush churn
+                state = on;
+                Background       = on ? OnBg : BgButton;
+                label.Foreground = on ? OnFg : FgDim;
+            }
+        }
+
+        // ── MiniFader ────────────────────────────────────────────────────────
+        //
+        // Compact horizontal fader. Drag to set, double-click for the default,
+        // wheel for fine steps. dB faders use the console taper; others are
+        // linear over [MinValue, MaxValue].
+        sealed class MiniFader : Canvas
+        {
+            readonly Rectangle track;
+            readonly Rectangle fill;
+            readonly Rectangle knob;
+            readonly bool      dbTaper;
+
+            public int MinValue { get; set; } = 0;
+            public int MaxValue { get; set; } = 181;
+            public int DefValue { get; set; } = 161;
+
+            int value = 161;
+            public int Value => value;
+
+            public bool IsDragging { get; private set; }
+            public event Action<int> ValueChanged;
+
+            public MiniFader(bool isDbTaper)
+            {
+                dbTaper = isDbTaper;
+                Height  = BarHeight;
+                ClipToBounds = true;
+                Background   = Brushes.Transparent;
+
+                track = new Rectangle { Height = BarHeight, Fill = FaderTrack, RadiusX = 1.5, RadiusY = 1.5 };
+                SetLeft(track, 0); SetTop(track, 0);
+                Children.Add(track);
+
+                fill = new Rectangle { Height = BarHeight, Fill = FaderFill, RadiusX = 1.5, RadiusY = 1.5 };
+                SetLeft(fill, 0); SetTop(fill, 0);
+                Children.Add(fill);
+
+                knob = new Rectangle { Width = 3, Height = BarHeight, Fill = FaderKnob };
+                SetTop(knob, 0);
+                Children.Add(knob);
+
+                SizeChanged += (_, __) => { track.Width = ActualWidth; Redraw(); };
+                // Canvas doesn't size its own children, and SizeChanged may
+                // not have fired by first render — do an initial layout pass
+                // once the element is actually in the tree.
+                Loaded += (_, __) => { track.Width = ActualWidth; Redraw(); };
+
+                MouseLeftButtonDown += OnDown;
+                MouseMove           += OnMove;
+                MouseLeftButtonUp   += OnUp;
+                MouseWheel          += OnWheel;
+            }
+
+            void OnDown(object s, MouseButtonEventArgs e)
+            {
+                if (e.ClickCount == 2)
+                {
+                    Commit(DefValue);
+                    e.Handled = true;
+                    return;
+                }
+                IsDragging = true;
+                CaptureMouse();
+                ApplyFromX(e.GetPosition(this).X);
+                e.Handled = true;
+            }
+
+            void OnMove(object s, MouseEventArgs e)
+            {
+                if (!IsDragging) return;
+                ApplyFromX(e.GetPosition(this).X);
+            }
+
+            void OnUp(object s, MouseButtonEventArgs e)
+            {
+                if (!IsDragging) return;
+                IsDragging = false;
+                ReleaseMouseCapture();
+                e.Handled = true;
+            }
+
+            void OnWheel(object s, MouseWheelEventArgs e)
+            {
+                // dB faders step 2 codes (= 1 dB), or 1 code (0.5 dB) with Ctrl.
+                // Linear faders step 5, or 1 with Ctrl.
+                bool fine = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
+                int step  = dbTaper ? (fine ? 1 : 2) : (fine ? 1 : 5);
+                Commit(value + (e.Delta > 0 ? step : -step));
+                e.Handled = true;
+            }
+
+            void ApplyFromX(double x)
+            {
+                double w = ActualWidth;
+                if (w <= 0) return;
+                float travel = (float)Math.Clamp(x / w, 0.0, 1.0);
+                Commit(dbTaper
+                    ? FaderTaper.TravelToCode(travel)
+                    : (int)Math.Round(MinValue + travel * (MaxValue - MinValue)));
+            }
+
+            void Commit(int v)
+            {
+                v = Math.Clamp(v, MinValue, MaxValue);
+                if (v == value) return;
+                value = v;
+                Redraw();
+                ValueChanged?.Invoke(v);
+            }
+
+            /// Push a value in without raising ValueChanged — used when
+            /// refreshing from the parameters, so we don't write straight back.
+            public void SetValueSilent(int v)
+            {
+                v = Math.Clamp(v, MinValue, MaxValue);
+                if (v == value) return;
+                value = v;
+                Redraw();
+            }
+
+            void Redraw()
+            {
+                double w = ActualWidth;
+                if (w <= 0) return;
+
+                float travel = dbTaper
+                    ? FaderTaper.CodeToTravel(value)
+                    : (MaxValue > MinValue ? (value - MinValue) / (float)(MaxValue - MinValue) : 0f);
+
+                double x = Math.Clamp(travel * w, 0, w);
+                fill.Width = x;
+                SetLeft(knob, Math.Clamp(x - 1.5, 0, w - 3));
+            }
         }
     }
 }

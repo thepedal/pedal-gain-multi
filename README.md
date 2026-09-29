@@ -1,75 +1,125 @@
 # Pedal Gain Multi
 
-A multi-input gain / summing mixer for [ReBuzz](https://github.com/wasteddesign/ReBuzz),
-derived from **Pedal Gain** with ReBuzz Multi-In support.
+A multi-track mixer for [ReBuzz](https://github.com/wasteddesign/ReBuzz) with
+per-channel faders, pan, mute/solo, direct outs and broadcast-standard
+metering.
 
 ## Features
 
-- **6 stereo inputs → 1 stereo output** — connect up to six signals; they're summed at unity before the gain stage.
-- **Single Gain control** — 0 … 200 % (100 = unity / 0 dB, 200 = +6 dB).
-- **Per-input mute and solo** — each input has an "M" and "S" button.
-  Per-input mute fades using the global Inertia setting (same ramp as the
-  output mute). Solo follows the standard "if any soloed, only soloed
-  inputs route" rule; mute beats solo (a muted input stays silent even
-  when soloed). All states are real parameters — saved with the song,
-  automatable from the pattern editor, undoable.
-- **Output mute with adjustable inertia** — single "M" button at the top of
-  the output section. The fade time is set by the **Inertia** parameter
-  (0–500 ms, default 25 ms), so you can dial it from a tight 5 ms declick all
-  the way out to a half-second fade. `Inertia = 0` snaps instantly. Both
-  Mute and Inertia are real parameters — saved with the song, automatable,
-  undoable. Backwards compatible: songs saved before either parameter
-  existed load with Mute = false and Inertia = 25, so behaviour is
-  identical to previous versions.
-- **Metering at the top of the parameters window** — six pre-solo input
-  peak meters plus a stereo output meter. Instant-attack / exponential-release
-  ballistics on the audio thread, lightweight 33 ms UI redraw, held-peak line
-  with synchronized dB readout.
+**Mixing**
+
+- **1–24 stereo channels**, set by the machine's track count. New machines
+  start with 6. Each channel is an input pin; the strip is
+  Mono → Mute → Volume → Pan.
+- **Master output plus a direct out per channel.** Output 0 is the master
+  mix; output *k+1* carries channel *k* post-mute, post-fader and post-pan
+  but **pre-solo**, so Solo, the master Gain and Master Mute never touch a
+  direct out.
+- **dB faders** on every channel and the master, 0.5 dB per step from −80 dB
+  to +10 dB, with a console taper that gives the −20…+10 dB region most of
+  the throw.
+- **Pan** with the right law for the source: balance on stereo channels,
+  constant-power on channels summed to mono.
+- **Click-free everything.** Gain, Volume, Pan and Mono glide over ~10 ms;
+  mute and solo fade over an adjustable **Inertia** (0–500 ms, default 25).
+
+**Metering**
+
+- Per-channel peak meters with a switchable **PRE / POST** tap, IEC
+  ballistics (20 dB fall in 1.7 s), 3-second peak hold and clip indication.
+- **True-peak** master metering — 4× oversampled, so inter-sample peaks that
+  a sample-peak meter misses still show up.
+- A separate **meter window** per machine with tall bars for every channel
+  and the master pair: RMS solid over a translucent peak wash, hold lines,
+  clip boxes, M/S badges and dimming for channels not reaching the master.
+- **Loudness to EBU R128 / ITU-R BS.1770** — momentary, short-term and gated
+  integrated LUFS against a −23 or −14 LUFS target, plus a stereo
+  correlation meter.
+
+## Parameters
+
+| Scope | Name | Range | Default |
+|---|---|---|---|
+| Global | `Gain` | 0–181 (−∞ … +10 dB) | 161 (0 dB) |
+| Global | `Master Mute` | switch | off |
+| Global | `Inertia` | 0–500 ms | 25 ms |
+| Track | `Solo` | switch | off |
+| Track | `Mute` | switch | off |
+| Track | `Volume` | 0–181 (−∞ … +10 dB) | 161 (0 dB) |
+| Track | `Pan` | 0–128 (L … C … R) | 64 (centre) |
+| Track | `Mono` | switch | off |
+
+Level codes are 0.5 dB apart: 0 is −∞, 1 is −80 dB, 149 is −6 dB, 161 is
+0 dB and 181 is +10 dB. Hovering any parameter shows its value in dB, LR
+percentage or milliseconds.
+
+## Using it
+
+Connect sources to the input pins; each one is a channel. The parameter
+window gives you a strip per channel — mute, solo, meter with held-peak
+readout, VOL and PAN faders and a MONO toggle — over a master section.
+
+- `−` and `+` in the IN header change the channel count.
+- `PRE` / `POST` switches the channel meters between the raw input and the
+  post-fader signal.
+- Clicking any meter clears every held peak and clip light.
+- Faders respond to dragging, double-click (reset to default) and the mouse
+  wheel (1 dB per notch, 0.5 dB with Ctrl held).
+- `METERS` opens the meter bridge. Its `T -23` / `T -14` button picks the
+  loudness target and `RESET` restarts integration.
+
+## Upgrading from 1.x
+
+**2.0.0 is a breaking change.** The parameter layout is completely
+different — 1.x's `Solo 1..6`, `Mute 1..6`, single `Mute` and percentage
+`Gain` are gone, replaced by per-track parameters and dB faders. A song
+saved with 1.x will load with the machine present, but its Pedal Gain Multi
+settings will not carry over. Check any song that used it before relying on
+the result.
 
 ## Requirements
 
-- [ReBuzz](https://github.com/wasteddesign/ReBuzz) (1812-preview or later)
-- [.NET 10 Desktop Runtime (Windows x64)](https://dotnet.microsoft.com/en-us/download/dotnet/10.0)
+- ReBuzz 1813-preview or later (needs `EffectBlockMulti`)
+- [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/en-us/download/dotnet/10.0) (Windows x64)
 
 ## Building
 
 ```powershell
-dotnet build PedalGainMulti.csproj -c Release /p:ReBuzzDir="C:\Program Files\ReBuzz"
+dotnet build PedalGainMulti.csproj -c Release
 ```
 
-The output `Pedal Gain Multi.NET.dll` is written directly to `<ReBuzzDir>\Gear\Effects\`.
-Restart ReBuzz and the machine appears as **Pedal Gain Multi** under Effects.
+The DLL is written straight to `C:\Program Files\ReBuzz\Gear\Effects\`.
+If ReBuzz lives elsewhere:
 
-## How the Multi-In plumbing works
-
-Three pieces, copied from the Pedal Patch convention:
-
-1. **`MachineDecl`** declares `InputCount = 6, OutputCount = 1`.
-2. **`Song.MachineAdded`** event is hooked in the constructor so that
-   `host.InputChannelCount` / `host.OutputChannelCount` can be written as
-   soon as the machine joins the graph — `host.Machine` is null while the
-   constructor is running, so it can't be done there.
-3. **`Work(IList<Sample[]>, IList<Sample[]>, int, WorkModes)`** — the
-   EffectBlockMulti signature. `input[i]` is the stereo buffer for channel
-   `i` (or `null` if nothing is connected to that slot).
-
-`GetChannelName(bool input, int index)` provides the label shown in the
-connection-circle tooltip in ReBuzz's machine view.
-
-## How the meter stays cheap
-
-Meter ballistics run **in the audio thread**, inside `Work()`:
-
-```csharp
-MeterL = MathF.Max(peakL, MeterL * decay);
-MeterR = MathF.Max(peakR, MeterR * decay);
+```powershell
+dotnet build PedalGainMulti.csproj -c Release /p:ReBuzzDir="D:\ReBuzz"
 ```
 
-`decay = exp(-2.3 · n / sr)` gives a steady -20 dB/second release.
-`MeterL` and `MeterR` are `volatile float` — the UI thread reads them
-directly without any lock, and the 33 ms `DispatcherTimer` just repaints
-the two bar widths plus the peak-hold line. No allocations per frame, no
-cross-thread queues.
+Close ReBuzz before building — it holds the DLL open while running.
+
+## Notes on the implementation
+
+A few decisions worth knowing if you read or modify the source.
+
+**Metering is gated on a live reader.** True-peak filtering and K-weighting
+are expensive, and nothing needs them when no meter is on screen. Each
+`TakeMeters` call stamps a block counter; the audio thread skips the
+expensive analysis about two seconds after the last poll and resumes from
+the next block when polling restarts. A machine sitting in a song with its
+windows closed costs very little.
+
+**Four reader slots.** The parameter panel reads slot 0 and meter windows
+read slots 1–3, each with its own accumulator, so two readers never steal
+each other's peaks and no peak is lost between polls.
+
+**Loudness averages in the energy domain, never in dB.** Averaging LUFS
+values directly is the classic way to get integrated loudness subtly wrong;
+EBU 3341 cases 3–5 exist to catch exactly that. Verified against all five
+cases at 44.1 and 48 kHz, each landing within 0.07 LU of target.
+
+**Meter gradients use `BrushMappingMode.Absolute`** over the full bar
+length. Mapping relative to the lit portion instead makes every bar run
+green-to-red regardless of level, so quiet signals show red at the tip.
 
 ## License
 

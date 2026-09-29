@@ -42,7 +42,8 @@
     <AssemblyTitle>Pedal Gain Multi</AssemblyTitle>
     <Company>WDE</Company>
     <Product>Pedal Gain Multi</Product>
-    <Version>1.0.0</Version>
+    <!-- v2.0.0 — full re-architecture, ported from Buzz-1503 v1.7.0. -->
+    <Version>2.0.0</Version>
   </PropertyGroup>
 
   <!-- No XAML — GUI is built entirely in code to avoid BAML load issues. -->
