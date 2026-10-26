@@ -1,4 +1,4 @@
-// Pedal Gain Multi — ReBuzz managed effect machine (v2.0.0)
+// Pedal Gain Multi — ReBuzz managed effect machine (v2.0.2)
 //
 // A 1..24 channel mixer:
 //   • Each input pin is a channel; the strip is Mono -> Mute -> Volume -> Pan
@@ -355,14 +355,20 @@ namespace WDE.PedalGainMulti
         // for int params with MaxValue ≤ 254, ParameterType.Switch for bool.
 
         // #0 — Gain (dB code 0..181; 0 = -inf, 161 = 0 dB, 181 = +10 dB)
-        int gain = 161;
+        int gain = UnityDbCode;
         [ParameterDecl(
             Name        = "Gain",
             Description = "Master output fader (0 = -inf, 161 = 0 dB, 181 = +10 dB)",
             MinValue    = 0,
             MaxValue    = 181,
             DefValue    = 161)]
-        public int Gain { get => gain; set => gain = value; }
+        // Clamped on write. ManagedMachineHost.Tick range-checks before it
+        // calls us, but an external control machine (Pedal Muter, PeerCtrl,
+        // a pattern-driven peer) can call IParameter.SetValue directly and
+        // bypass that check — see the PedalMuter notes. `gain` indexes
+        // LevelTable[182], so an out-of-range value is an
+        // IndexOutOfRangeException on the audio thread, not a wrong level.
+        public int Gain { get => gain; set => gain = Math.Clamp(value, 0, MaxDbCode); }
 
         // #1 — Master Mute
         bool masterMute;
@@ -381,7 +387,7 @@ namespace WDE.PedalGainMulti
             MaxValue        = 500,
             DefValue        = 25,
             ValueDescriptor = Descriptors.Milliseconds)]
-        public int Inertia { get => inertia; set => inertia = value; }
+        public int Inertia { get => inertia; set => inertia = Math.Clamp(value, 0, 500); }
 
         // ── Per-track state arrays ───────────────────────────────────────────
         // Sized to MaxTracks; only the first `trackCount` entries are ever
@@ -394,17 +400,324 @@ namespace WDE.PedalGainMulti
         readonly int[]  pan    = new int[MaxTracks];
         readonly bool[] mono   = new bool[MaxTracks];
 
+        // ── Core §14 recovery: sibling-track pvalue polling ──────────────────
+        //
+        // ReBuzz's `parametersChanged` is keyed by PARAMETER, not by
+        // (parameter, track). ParameterCore.SetValue does:
+        //
+        //     pvalues[track] = value;
+        //     machine.parametersChanged[this] = track;      // <- overwrites
+        //
+        // and ManagedMachineHost.Tick then walks that dictionary calling our
+        // setter ONCE per parameter, for whichever track wrote last. Every
+        // other track's write that tick is silently dropped.
+        //
+        // With a MIDI control surface this happens constantly: a bank of
+        // faders or a row of mute buttons writes several tracks' Volume (or
+        // Mute) inside one tick and all but one write vanishes. The visible
+        // symptom is a control that "doesn't take" until you move it again.
+        //
+        // Every track's value IS still sitting in the parameter's pvalues
+        // array when our setter runs — ClearPVal only happens at the END of
+        // the tick — so we recover the dropped writes by reading pvalues
+        // directly. This is the standard workaround used across this machine
+        // family (Pedal Tracker, Pedal M1, Pedal Presetter, Pedal Muter).
+        sealed class PolledParam
+        {
+            public string         Name;
+            public IParameter     Param;
+            public Func<int, int> Read;      // track -> raw pvalue
+            public int            NoValue;
+            public Action<int, int> Apply;   // (track, rawValue)
+            public int            UiIndex;   // index into uiShadow / uiCooldown
+        }
+
+        PolledParam[] polled;          // null until the probe succeeds
+        int           probeAttempts;
+
+        /// True once the pvalues probe has succeeded and dropped-write
+        /// recovery is live. If ReBuzz ever changes the pvalues field again
+        /// (it has before: ConcurrentDictionary -> int[]) the probe fails,
+        /// this stays false, and the machine degrades to the unrecovered
+        /// behaviour rather than crashing — so it is worth being able to see.
+        public bool PollRecoveryActive => polled != null;
+
+        /// How many times the probe has been attempted. A large number with
+        /// PollRecoveryActive false means the field could not be resolved.
+        public int PollProbeAttempts => probeAttempts;
+
+        // The pvalues array starts life as `new int[256]` — all zeros — and
+        // only becomes meaningful once ReBuzz has run ClearPVal at least
+        // once (which fills it with NoValue). Zero is a perfectly valid
+        // value for Volume (-inf) and Pan (hard left), so polling before
+        // that first clear would silently drive every untouched track to
+        // silence and hard-left. We arm the poll only after observing a
+        // genuine NoValue, which proves a clear has happened.
+        bool pollArmed;
+
+        // Resolve our own track parameters and a reader for their private
+        // pvalues store. Retries until it succeeds — never latches an
+        // "attempted" flag, because ParameterGroups are not populated until
+        // after the constructor and a single early failure would otherwise
+        // disable recovery for the lifetime of the machine.
+        void TryProbePValues()
+        {
+            if (polled != null) return;
+            probeAttempts++;
+
+            try
+            {
+                var groups = host?.Machine?.ParameterGroups;
+                if (groups == null) return;
+
+                IParameterGroup trackGroup = null;
+                foreach (var g in groups)
+                    if (g != null && g.Type == ParameterGroupType.Track) { trackGroup = g; break; }
+                if (trackGroup?.Parameters == null) return;
+
+                var list = new List<PolledParam>(5);
+                foreach (var p in trackGroup.Parameters)
+                {
+                    if (p == null) continue;
+                    var reader = MakePValueReader(p);
+                    if (reader == null) return;        // probe failed — retry next time
+
+                    Action<int, int> apply;
+                    int ui;
+                    switch (p.Name)
+                    {
+                        case "Solo":   apply = (t, v) => solo  [t] = v != 0;                      ui = UiSolo;   break;
+                        case "Mute":   apply = (t, v) => mute  [t] = v != 0;                      ui = UiMute;   break;
+                        case "Mono":   apply = (t, v) => mono  [t] = v != 0;                      ui = UiMono;   break;
+                        case "Volume": apply = (t, v) => volume[t] = Math.Clamp(v, 0, MaxDbCode); ui = UiVolume; break;
+                        case "Pan":    apply = (t, v) => pan   [t] = Math.Clamp(v, 0, MaxPanCode);ui = UiPan;    break;
+                        default: continue;
+                    }
+
+                    list.Add(new PolledParam {
+                        Name = p.Name, Param = p, Read = reader,
+                        NoValue = p.NoValue, Apply = apply, UiIndex = ui
+                    });
+                }
+
+                if (list.Count == 0) return;
+                polled = list.ToArray();                // commit only on full success
+            }
+            catch { /* transient — retry on the next setter call */ }
+        }
+
+        // ParameterCore.pvalues has changed representation across ReBuzz
+        // versions: ConcurrentDictionary<int,int> on older builds, int[256]
+        // on current ones. An `as` cast to the wrong one returns null
+        // silently and disables recovery with no error, so detect the shape
+        // once and close over whichever is present.
+        static Func<int, int> MakePValueReader(IParameter p)
+        {
+            try
+            {
+                var fi = p.GetType().GetField("pvalues",
+                    System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.Instance);
+                if (fi == null) return null;
+
+                object raw = fi.GetValue(p);
+                if (raw == null) return null;
+
+                if (raw is int[] arr)
+                    return t => (uint)t < (uint)arr.Length ? arr[t] : p.NoValue;
+
+                if (raw is System.Collections.Concurrent.ConcurrentDictionary<int, int> dict)
+                    return t => dict.TryGetValue(t, out int v) ? v : p.NoValue;
+
+                return null;
+            }
+            catch { return null; }
+        }
+
+        // Called from every track-parameter setter. Re-applies any track's
+        // value that is sitting in pvalues this tick, which recovers the
+        // writes `parametersChanged` dropped. Idempotent: the firing track's
+        // own pvalue is exactly the value the setter was just handed, so
+        // re-applying it is a no-op.
+        void RecoverDroppedTrackWrites()
+        {
+            if (polled == null) TryProbePValues();
+            var ps = polled;
+            if (ps == null) return;
+
+            int n = Volatile.Read(ref trackCount);
+            if (n < 1) n = 1;
+            if (n > MaxTracks) n = MaxTracks;
+
+            // Pass 1 — arm. Seeing a single NoValue anywhere proves ReBuzz has
+            // run ClearPVal on this machine, so the array holds real data
+            // rather than its initial all-zero state. This has to be a
+            // separate pass: arming inside the apply loop would skip every
+            // track examined before the first NoValue turned up.
+            if (!pollArmed)
+            {
+                for (int i = 0; i < ps.Length && !pollArmed; i++)
+                {
+                    var pp = ps[i];
+                    for (int t = 0; t < n; t++)
+                        if (pp.Read(t) == pp.NoValue) { pollArmed = true; break; }
+                }
+                if (!pollArmed) return;
+            }
+
+            // Pass 2 — apply every value present this tick. Idempotent: the
+            // firing track's own pvalue is the value the setter was just
+            // handed, so re-applying it changes nothing.
+            for (int i = 0; i < ps.Length; i++)
+            {
+                var pp = ps[i];
+                for (int t = 0; t < n; t++)
+                {
+                    int v = pp.Read(t);
+                    if (v != pp.NoValue) pp.Apply(t, v);
+                }
+            }
+        }
+
+        // ── ReBuzz parameter-window UI sync ──────────────────────────────────
+        //
+        // The same `parametersChanged` bottleneck that dropped our setter
+        // calls also starves ReBuzz's OWN parameter sliders. MachineWorkInstance
+        // calls `par.InvokeEvents(buzz, track)` from the same one-entry-per-
+        // parameter dictionary, so only the surviving track's ParameterVM gets
+        // a valueChanged event — and ParameterVM.Value is read lazily
+        // (`parameter.GetValue(track)`), repainting only when that event
+        // arrives. The underlying value is correct; the slider is just stale.
+        //
+        // Our own panel never shows this because RefreshControlsFromParameters
+        // polls GetValue every frame. ReBuzz's generic slider list does not.
+        //
+        // We can detect it exactly rather than by guesswork. The host calls
+        // our setter and InvokeEvents from the SAME dictionary entry, so:
+        //
+        //     "our setter ran for (param, track)"
+        //         <=> "the host raised the UI event for (param, track)"
+        //
+        // So every setter call records the value the UI has therefore been
+        // told about. Any track where GetValue has since moved away from that
+        // shadow is a track whose event was dropped, and we nudge it: a
+        // value-preserving re-write of the value the parameter already holds,
+        // whose only effect is to make the host raise the event next tick.
+        //
+        // The nudge sets the parameter to `GetValue(track)` — not to our own
+        // cached copy — so it cannot clobber a fresher write by construction,
+        // and it carries ReBuzz's do-not-record flag so it never leaks into
+        // pattern recording.
+        const int UiSolo = 0, UiMute = 1, UiVolume = 2, UiPan = 3, UiMono = 4;
+        const int UiParamCount = 5;
+
+        // ParameterCore.SetValue: `track & (1 << 16)` suppresses
+        // RecordControlChange, so a nudge never writes pattern data.
+        const int NoRecordFlag = 1 << 16;
+
+        // Frames to wait before reconsidering a track we have just nudged.
+        // One nudge per parameter per frame is the most that can ever land —
+        // two in the same tick would collide in the very dictionary slot we
+        // are working around — and the cooldown stops a nudge that gets
+        // displaced from being re-issued every single frame.
+        const int UiNudgeCooldown = 4;
+
+        readonly int[,] uiShadow   = new int[UiParamCount, MaxTracks];
+        readonly int[,] uiCooldown = new int[UiParamCount, MaxTracks];
+        bool uiBaselined;
+        int  uiNudgeCount;
+
+        /// Total UI nudges issued. Should sit at zero on a single-track song
+        /// and climb only when several tracks of one parameter move together.
+        public int UiNudgeCount => uiNudgeCount;
+
+        // Called from every track setter. Reaching here proves the host
+        // dispatched this (parameter, track), and therefore also raised its
+        // valueChanged event, so the parameter window is up to date for it.
+        void NoteUiDelivered(int ui, int track, int rawValue)
+        {
+            if ((uint)track < MaxTracks) uiShadow[ui, track] = rawValue;
+        }
+
+        /// Repaint any parameter-window slider the host forgot to notify.
+        /// Call from the GUI timer; returns the number of nudges issued.
+        /// Deliberately NOT called from the audio path — this is a view
+        /// problem, and with no view open there is nothing to repair.
+        public int SyncParameterUi()
+        {
+            if (polled == null) TryProbePValues();
+            var ps = polled;
+            if (ps == null) return 0;
+
+            int n = Volatile.Read(ref trackCount);
+            if (n < 1) n = 1;
+            if (n > MaxTracks) n = MaxTracks;
+
+            try
+            {
+                // First call: the window has just bound its ParameterVMs and
+                // read GetValue for each, so the view is in sync right now.
+                // Baselining here rather than at construction avoids a burst
+                // of pointless nudges from SetParameterDefaults, which writes
+                // every parameter on every track at machine creation.
+                if (!uiBaselined)
+                {
+                    for (int i = 0; i < ps.Length; i++)
+                        for (int t = 0; t < MaxTracks; t++)
+                            uiShadow[ps[i].UiIndex, t] = ps[i].Param.GetValue(t);
+                    uiBaselined = true;
+                    return 0;
+                }
+
+                int nudged = 0;
+                for (int i = 0; i < ps.Length; i++)
+                {
+                    var pp = ps[i];
+                    int ui = pp.UiIndex;
+                    int target = -1, targetValue = 0;
+
+                    for (int t = 0; t < n; t++)
+                    {
+                        if (uiCooldown[ui, t] > 0) { uiCooldown[ui, t]--; continue; }
+                        if (target >= 0) continue;
+
+                        int cur = pp.Param.GetValue(t);
+                        if (cur != uiShadow[ui, t]) { target = t; targetValue = cur; }
+                    }
+
+                    if (target < 0) continue;
+
+                    // Value-preserving by construction: we write back exactly
+                    // what the parameter already holds. The shadow is NOT
+                    // updated here — only the setter callback may do that, so
+                    // a nudge that loses the dictionary slot to a real write
+                    // is simply retried once its cooldown expires.
+                    pp.Param.SetValue(target | NoRecordFlag, targetValue);
+                    uiCooldown[ui, target] = UiNudgeCooldown;
+                    nudged++;
+                    uiNudgeCount++;
+                }
+                return nudged;
+            }
+            catch { return 0; }
+        }
+
         // ── Precomputed dB code → linear gain table ──────────────────────────
         // g[0] = 0 (mute); g[c] = 10^((c - 161) · 0.5 / 20) for c in 1..181.
         // Used by DescribeValue for display and — later — by the engine as the
         // per-block target gain lookup. Built once at type-init.
+        public const int MaxDbCode  = 181;   // 0 = -inf, 161 = 0 dB, 181 = +10 dB
+        public const int UnityDbCode = 161;
+        public const int MaxPanCode = 128;   // 0 = L, 64 = C, 128 = R
+        public const int CentrePan  = 64;
+
         internal static readonly float[] LevelTable = BuildLevelTable();
         static float[] BuildLevelTable()
         {
-            var t = new float[182];
+            var t = new float[MaxDbCode + 1];
             t[0] = 0f;
-            for (int c = 1; c <= 181; c++)
-                t[c] = (float)Math.Pow(10.0, (c - 161) * 0.5 / 20.0);
+            for (int c = 1; c <= MaxDbCode; c++)
+                t[c] = (float)Math.Pow(10.0, (c - UnityDbCode) * 0.5 / 20.0);
             return t;
         }
 
@@ -418,8 +731,8 @@ namespace WDE.PedalGainMulti
             // have run for every track.
             for (int t = 0; t < MaxTracks; t++)
             {
-                volume[t] = 161;   // 0 dB
-                pan[t]    = 64;    // Centre
+                volume[t] = UnityDbCode;   // 0 dB
+                pan[t]    = CentrePan;     // Centre
             }
 
             // Channel counts and the machine's own IMachine ref only become
@@ -443,6 +756,8 @@ namespace WDE.PedalGainMulti
         public void SetSolo(bool v, int track)
         {
             if ((uint)track < MaxTracks) solo[track] = v;
+            NoteUiDelivered(UiSolo, track, v ? 1 : 0);
+            RecoverDroppedTrackWrites();
         }
 
         // #4 — Mute (per-track)
@@ -453,6 +768,8 @@ namespace WDE.PedalGainMulti
         public void SetMute(bool v, int track)
         {
             if ((uint)track < MaxTracks) mute[track] = v;
+            NoteUiDelivered(UiMute, track, v ? 1 : 0);
+            RecoverDroppedTrackWrites();
         }
 
         // #5 — Volume (per-track, dB code 0..181)
@@ -464,7 +781,9 @@ namespace WDE.PedalGainMulti
             DefValue    = 161)]
         public void SetVolume(int v, int track)
         {
-            if ((uint)track < MaxTracks) volume[track] = v;
+            if ((uint)track < MaxTracks) volume[track] = Math.Clamp(v, 0, MaxDbCode);
+            NoteUiDelivered(UiVolume, track, v);
+            RecoverDroppedTrackWrites();
         }
 
         // #6 — Pan (per-track, 0=L, 64=C, 128=R)
@@ -476,7 +795,9 @@ namespace WDE.PedalGainMulti
             DefValue    = 64)]
         public void SetPan(int v, int track)
         {
-            if ((uint)track < MaxTracks) pan[track] = v;
+            if ((uint)track < MaxTracks) pan[track] = Math.Clamp(v, 0, MaxPanCode);
+            NoteUiDelivered(UiPan, track, v);
+            RecoverDroppedTrackWrites();
         }
 
         // #7 — Mono (per-track)
@@ -487,6 +808,8 @@ namespace WDE.PedalGainMulti
         public void SetMono(bool v, int track)
         {
             if ((uint)track < MaxTracks) mono[track] = v;
+            NoteUiDelivered(UiMono, track, v ? 1 : 0);
+            RecoverDroppedTrackWrites();
         }
 
         // ── Song event handlers ──────────────────────────────────────────────
@@ -569,8 +892,8 @@ namespace WDE.PedalGainMulti
                 solo[t]   = false;
                 mute[t]   = false;
                 mono[t]   = false;
-                volume[t] = 161;
-                pan[t]    = 64;
+                volume[t] = UnityDbCode;
+                pan[t]    = CentrePan;
 
                 muteGainCur[t]  = 1f;
                 soloGateCur[t]  = 1f;

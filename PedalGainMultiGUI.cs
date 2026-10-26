@@ -607,6 +607,10 @@ namespace WDE.PedalGainMulti
 
             RefreshControlsFromParameters();
 
+            // Repaint any of ReBuzz's own parameter sliders the host forgot
+            // to notify (see PedalGainMultiMachine.SyncParameterUi).
+            machine.SyncParameterUi();
+
             var snap = machine.TakeMeters(0);
             if (snap == null) return;
 
